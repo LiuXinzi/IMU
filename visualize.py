@@ -4,13 +4,13 @@ import matplotlib.pyplot as plt
 import pickle
 
 
-# ---------------------- 結果の読み込み ---------------------#
+# ---------------------- 结果读取 ---------------------#
 with open("../results/all_results.pkl", "rb") as f:
     data = pickle.load(f)
 true_joints_cm_list = data["true_joints_cm_list"]
 pred_joints_cm_list = data["pred_joints_cm_list"]
 
-#可視化する動作データを設定
+# 设置要可视化的动作数据
 idx = 8
 true_joints_cm = true_joints_cm_list[idx]
 pred_joints_cm = pred_joints_cm_list[idx]
@@ -19,7 +19,7 @@ print(f"{len(true_joints_cm_list)}個の動作データのうち、 {idx + 1} �
 print(f"フレーム数: {len(true_joints_cm)}")
 
 
-# ---------------------- SMPL構造の関節接続定義 ---------------------#
+# ---------------------- SMPL结构的关节连接定义 ---------------------#
 SMPL_CONNECTIONS = [
     (0, 1), (1, 4), (4, 7), (7, 10),
     (0, 2), (2, 5), (5, 8), (8, 11), 
@@ -29,7 +29,7 @@ SMPL_CONNECTIONS = [
 ]
 
 
-# ---------------------- 1フレームを描く関数 ---------------------#
+# ---------------------- 绘制单帧的函数 ---------------------#
 def plot_smpl_frame(ax, joints, color):
     for (i, j) in SMPL_CONNECTIONS:
         ax.plot(
@@ -40,13 +40,13 @@ def plot_smpl_frame(ax, joints, color):
         )
     ax.scatter(joints[:, 0], joints[:, 1], joints[:, 2], c=color, s=15)
 
-# ---------------------- アニメーションの作成・表示 ---------------------#
+# ---------------------- 创建并显示动画 ---------------------#
 from matplotlib.animation import FuncAnimation
 
 fig = plt.figure(figsize=(8, 6))
 ax = fig.add_subplot(111, projection='3d')
 
-# 軸範囲を固定（データに合わせて調整）
+# 固定坐标轴范围（可根据数据调整）
 ax.set_xlim(-50, 50)
 ax.set_ylim(-50, 50)
 ax.set_zlim(-80, 80)
@@ -54,13 +54,13 @@ ax.set_xlabel("X")
 ax.set_ylabel("Y")
 ax.set_zlabel("Z")
 
-# 初期化
+# 初始化
 true_plot, = ax.plot([], [], [], color='blue', lw=2, label='True')
 pred_plot, = ax.plot([], [], [], color='red', lw=2, label='Pred')
 ax.legend()
 
 def update(frame):
-    ax.cla()  # クリア
+    ax.cla()  # 清除
     ax.set_xlim(-50, 50)
     ax.set_ylim(-50, 50)
     ax.set_zlim(-80, 80)
@@ -69,9 +69,9 @@ def update(frame):
     ax.set_zlabel("Z")
     ax.set_title(f"Frame {frame}")
 
-    # 真の関節
+    # 真实关节
     plot_smpl_frame(ax, true_joints_cm[frame], color='blue')
-    # 予測関節
+    # 预测关节
     plot_smpl_frame(ax, pred_joints_cm[frame], color='red')
 
     return ax,
@@ -80,12 +80,12 @@ ani = FuncAnimation(fig, update, frames=len(true_joints_cm), interval=50)
 plt.show()
 
 
-# ------------------ アニメーションを保存 ------------------#
-base_dir = os.path.dirname(os.path.abspath(__file__))  # scriptsフォルダ
+# ------------------ 保存动画 ------------------#
+base_dir = os.path.dirname(os.path.abspath(__file__))  # scripts 文件夹
 results_dir = os.path.join(base_dir, "../results")
 os.makedirs(results_dir, exist_ok=True)
 
-# ループの中で idx ごとにファイル名を変える
+# 在循环中根据 idx 修改文件名
 mp4_path = os.path.join(results_dir, f"pose{idx + 1:03d}_visualization.mp4")
 ani.save(mp4_path, writer="ffmpeg", fps=20)
 print(f"アニメーションを保存しました: {mp4_path}")

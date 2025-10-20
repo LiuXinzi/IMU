@@ -6,7 +6,7 @@ import numpy as np
 from fstar_watanabe import STAR
 from scipy.spatial.transform import Rotation as R
 
-# ------------------- 関数 ------------------- #
+# ------------------- 函数 ------------------- #
 EPSILON = 1e-3
 
 def dot_product(v1, v2):
@@ -55,12 +55,12 @@ def simulate_IMU(skin_verts, idx1, idx2, idx3):
     orientation_quat = compute_orientation(x_axis, y_axis, z_axis)
     return mean_position, orientation_quat
 
-# ------------------- ディレクトリ設定 ------------------- #
+# ------------------- 目录设置 ------------------- #
 target_dir = os.path.join(os.path.dirname(__file__), "../CMU")
 output_dir = os.path.join(os.path.dirname(__file__), "../processed")
 os.makedirs(output_dir, exist_ok=True)
 
-# ------------------- CMUファイル一覧取得 ------------------- #
+# ------------------- 获取 CMU 文件列表 ------------------- #
 npz_files = []
 for root, dirs, files in os.walk(target_dir):
     for file in files:
@@ -69,7 +69,7 @@ for root, dirs, files in os.walk(target_dir):
 
 print(f"見つかったファイル数: {len(npz_files)}")
 
-# ------------------- ファイルごとに処理 ------------------- #
+# ------------------- 按文件逐一处理 ------------------- #
 for file_path in npz_files:
     print(f"処理中: {file_path}")
     mocap_data = dict(np.load(file_path))

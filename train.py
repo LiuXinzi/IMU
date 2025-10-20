@@ -5,11 +5,11 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import TensorDataset, DataLoader
-from model_def import PoseLSTM  #モデルを「model_def.py」ファイルからインポート
+from model_def import PoseLSTM  # 从 “model_def.py” 文件中导入模型
 import pickle
 
 
-# ------------------- ハイパーパラメータ ------------------- #
+# ------------------- 超参数 ------------------- #
 TRAIN_RATIO = 0.8
 VAL_RATIO = 0.1
 window_size = 50
@@ -20,7 +20,7 @@ epochs = 10
 learning_rate = 1e-3
 
 
-# ------------------- 関数定義 ------------------- #
+# ------------------- 函数定义 ------------------- #
 def load_split(file_list):
     acc_list, quat_list, joints_list = [], [], []
     for fpath in file_list:
@@ -49,7 +49,7 @@ def create_window(X, Y, window_size, step_size):
     for start in range(0, n_frames - window_size + 1, step_size):
         end = start + window_size
         X_windows.append(X_flat[start:end])  # (window_size, feature_dim)
-        Y_windows.append(Y_flat[end - 1])    # 窓の最後のフレーム
+        Y_windows.append(Y_flat[end - 1])    # 窗口的最后一帧
     return np.array(X_windows), np.array(Y_windows)
 
 def create_windows_from_lists(X_list, Y_list, window_size, step_size):
@@ -58,24 +58,24 @@ def create_windows_from_lists(X_list, Y_list, window_size, step_size):
         X_w, Y_w = create_window(X, Y, window_size, step_size)
         X_windows_all.append(X_w)
         Y_windows_all.append(Y_w)
-    # すべての窓を結合
+    # 合并所有窗口
     X_windows = np.concatenate(X_windows_all, axis=0)
     Y_windows = np.concatenate(Y_windows_all, axis=0)
     return X_windows, Y_windows
 
 
-# ------------------- データ読み込みと分割 ------------------- #
+# ------------------- 数据读取与划分 ------------------- #
 processed_dir = "../processed"
 files = [os.path.join(processed_dir, f) for f in os.listdir(processed_dir) if f.endswith(".npz")]
 
-# ファイル単位でシャッフル
+# 以文件为单位打乱顺序
 np.random.seed(123)
 np.random.shuffle(files)
 
-# 20ファイルのみ取得（np.random.seed(123)があれば毎回同じファイルが選ばれる）
+# 仅选取 20 个文件（设置 np.random.seed(123) 时每次都会选中相同的文件）
 files = files[:100]
 
-# ファイル単位の分割
+# 按文件划分数据
 n_files = len(files)
 n_train = int(n_files * TRAIN_RATIO)
 n_val = int(n_files * VAL_RATIO)
@@ -86,19 +86,19 @@ print(f"trainファイル数: {len(train_files)}")
 print(f"valファイル数: {len(val_files)}")
 print(f"testファイル数: {len(test_files)}")
 
-# 各セットを読み込んで結合
+# 读取并合并各个集合
 acc_list_train, quat_list_train, joints_list_train = load_split(train_files)
 acc_list_val, quat_list_val, joints_list_val       = load_split(val_files)
 acc_list_test, quat_list_test, joints_list_test    = load_split(test_files)
 
-# pelvis基準の相対座標化
+# 相对于骨盆基准进行坐标转换
 joints_list_train = pelvis_relative(joints_list_train)
 joints_list_val   = pelvis_relative(joints_list_val)
 joints_list_test  = pelvis_relative(joints_list_test)
 
 
-# ------------------- 正規化 ------------------- #
-# train全体の平均・分散を取るためだけに結合
+# ------------------- 归一化 ------------------- #
+# 仅为了计算整个训练集的均值和方差而拼接
 acc_all_train    = np.concatenate(acc_list_train, axis=0)
 quat_all_train   = np.concatenate(quat_list_train, axis=0)
 joints_all_train = np.concatenate(joints_list_train, axis=0)
@@ -107,7 +107,7 @@ acc_mean, acc_std       = acc_all_train.mean(axis=(0, 1)), acc_all_train.std(axi
 quat_mean, quat_std     = quat_all_train.mean(axis=(0, 1)), quat_all_train.std(axis=(0, 1)) + 1e-6
 joints_mean, joints_std = joints_all_train.mean(axis=(0, 1)), joints_all_train.std(axis=(0, 1)) + 1e-6
 
-# 各ファイルを正規化（境界を守る）
+# 对每个文件做归一化（保持边界）
 acc_list_train = [normalize(a, acc_mean, acc_std) for a in acc_list_train]
 acc_list_val   = [normalize(a, acc_mean, acc_std) for a in acc_list_val]
 acc_list_test  = [normalize(a, acc_mean, acc_std) for a in acc_list_test]
@@ -121,7 +121,7 @@ joints_list_val   = [normalize(j, joints_mean, joints_std) for j in joints_list_
 joints_list_test  = [normalize(j, joints_mean, joints_std) for j in joints_list_test]
 
 
-# ------------------- X, Y を作成 ------------------- #
+# ------------------- 构建 X 和 Y ------------------- #
 # X : acc + quat
 X_list_train = [np.concatenate([a, q], axis=-1) for a, q in zip(acc_list_train, quat_list_train)]
 X_list_val   = [np.concatenate([a, q], axis=-1) for a, q in zip(acc_list_val, quat_list_val)]
@@ -131,14 +131,14 @@ Y_list_train = joints_list_train
 Y_list_val   = joints_list_val
 Y_list_test  = joints_list_test
 
-# flatten((N, 6, 7) → (N, 42)) → 窓作成
+# flatten((N, 6, 7) → (N, 42)) → 构建窗口
 X_train_win, Y_train_win = create_windows_from_lists(X_list_train, Y_list_train, window_size, step_size_train)
 X_val_win, Y_val_win     = create_windows_from_lists(X_list_val, Y_list_val, window_size, step_size_train)
 
-#test用のX,Yは動作ごとに可視化したいため、リストのまま窓分け
+# 测试用的 X、Y 想按动作可视化，因此保持列表并按窗口划分
 X_test_win_list, Y_test_win_list = [], []
 for X, Y in zip(X_list_test, Y_list_test):
-    # flattenしてwindow化
+    # 扁平化后生成窗口
     X_win, Y_win = create_window(X, Y, window_size, step_size_test)
     X_test_win_list.append(X_win)
     Y_test_win_list.append(Y_win)
@@ -154,7 +154,7 @@ train_loader = DataLoader(TensorDataset(X_train_tensor, Y_train_tensor), batch_s
 val_loader   = DataLoader(TensorDataset(X_val_tensor, Y_val_tensor), batch_size=batch_size, shuffle=False)
 
 
-# ------------------- 学習 ------------------- #
+# ------------------- 训练 ------------------- #
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model = PoseLSTM().to(device)
 criterion = nn.MSELoss()
@@ -173,7 +173,7 @@ for epoch in range(epochs):
         train_loss += loss.item() * X_batch.size(0)
     train_loss /= len(train_loader.dataset)
 
-    # 検証
+    # 验证
     model.eval()
     val_loss = 0.0
     with torch.no_grad():
@@ -187,8 +187,8 @@ for epoch in range(epochs):
     print(f"Epoch [{epoch+1}/{epochs}] Train Loss: {train_loss:.4f}  Val Loss: {val_loss:.4f}")
 
 
-# ------------------ 保存フォルダの設定 ------------------ #
-base_dir = os.path.dirname(os.path.abspath(__file__))  # scriptsフォルダ
+# ------------------ 设置保存文件夹 ------------------ #
+base_dir = os.path.dirname(os.path.abspath(__file__))  # scripts 文件夹
 models_dir = os.path.join(base_dir, "../models")
 test_data_dir = os.path.join(base_dir, "../test_data")
 
@@ -196,20 +196,20 @@ os.makedirs(models_dir, exist_ok=True)
 os.makedirs(test_data_dir, exist_ok=True)
 
 
-# ------------------ 正規化パラメータの保存 ----------------- #
+# ------------------ 保存归一化参数 ----------------- #
 norm_params_path = os.path.join(models_dir, "norm_params.npz")
 np.savez(norm_params_path,
          joints_mean=joints_mean, joints_std=joints_std)
 print(f"正規化パラメータを保存しました: {norm_params_path}")
 
 
-# ------------------ モデルを保存 ------------------ #
+# ------------------ 保存模型 ------------------ #
 model_path = os.path.join(models_dir, "best_model.pth")
 torch.save(model.state_dict(), model_path)
 print(f"モデルを保存しました: {model_path}")
 
 
-# ------------------ テストデータを保存 ------------------ #
+# ------------------ 保存测试数据 ------------------ #
 test_data_path = os.path.join(test_data_dir, "test_data.pkl")
 with open(test_data_path, "wb") as f:
     pickle.dump({
