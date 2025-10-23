@@ -56,8 +56,8 @@ def simulate_IMU(skin_verts, idx1, idx2, idx3):
     return mean_position, orientation_quat
 
 # ------------------- 目录设置 ------------------- #
-target_dir = os.path.join(os.path.dirname(__file__), "../CMU")
-output_dir = os.path.join(os.path.dirname(__file__), "../processed")
+target_dir = os.path.join(os.path.dirname(__file__), "CMU")
+output_dir = os.path.join(os.path.dirname(__file__), "processed_try")
 os.makedirs(output_dir, exist_ok=True)
 
 # ------------------- 获取 CMU 文件列表 ------------------- #
@@ -70,7 +70,7 @@ for root, dirs, files in os.walk(target_dir):
 print(f"見つかったファイル数: {len(npz_files)}")
 
 # ------------------- 按文件逐一处理 ------------------- #
-for file_path in npz_files:
+for file_path in npz_files[:5]:
     print(f"処理中: {file_path}")
     mocap_data = dict(np.load(file_path))
     gender = mocap_data['gender']

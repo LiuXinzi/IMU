@@ -1,23 +1,48 @@
 import os
+import time
 import numpy as np
 from sklearn.model_selection import train_test_split
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import TensorDataset, DataLoader
+import wandb
 from model_def import PoseLSTM  # 从 “model_def.py” 文件中导入模型
 import pickle
 
 
 # ------------------- 超参数 ------------------- #
-TRAIN_RATIO = 0.8
-VAL_RATIO = 0.1
+TRAIN_RATIO = 0.9
+VAL_RATIO = 0.05
 window_size = 50
 step_size_train = 25
 step_size_test = 1
-batch_size = 32
-epochs = 10
+batch_size = 1024
+epochs = 1000
 learning_rate = 1e-3
+# ------------------ 初始化 wandb ------------------ #
+wandb.init(
+    project="Pose_LSTM",
+    name="PoseLSTM_run",
+    config={
+        "epochs": epochs,
+        "batch_size": batch_size,
+        "learning_rate": learning_rate,
+        "window_size": window_size,
+        "step_size_train": step_size_train,
+        "model": "BiLSTM-2Layer-512Hidden",
+        "optimizer": "Adam",
+        "loss": "MSELoss"
+    }
+)
+
+# ------------------ 设置保存文件夹 ------------------ #
+base_dir = os.path.dirname(os.path.abspath(__file__))  # scripts 文件夹
+models_dir = os.path.join(base_dir, "models")
+test_data_dir = os.path.join(base_dir, "test_data")
+
+os.makedirs(models_dir, exist_ok=True)
+os.makedirs(test_data_dir, exist_ok=True)
 
 
 # ------------------- 函数定义 ------------------- #
@@ -56,24 +81,26 @@ def create_windows_from_lists(X_list, Y_list, window_size, step_size):
     X_windows_all, Y_windows_all = [], []
     for X, Y in zip(X_list, Y_list):
         X_w, Y_w = create_window(X, Y, window_size, step_size)
-        X_windows_all.append(X_w)
-        Y_windows_all.append(Y_w)
+        if X_w.shape[0] != 0:
+            X_windows_all.append(X_w)
+            Y_windows_all.append(Y_w)
     # 合并所有窗口
+    # import ipdb;ipdb.set_trace()
     X_windows = np.concatenate(X_windows_all, axis=0)
     Y_windows = np.concatenate(Y_windows_all, axis=0)
     return X_windows, Y_windows
 
 
 # ------------------- 数据读取与划分 ------------------- #
-processed_dir = "../processed"
+processed_dir = "processed_try"
 files = [os.path.join(processed_dir, f) for f in os.listdir(processed_dir) if f.endswith(".npz")]
-
+# import ipdb;ipdb.set_trace()
 # 以文件为单位打乱顺序
-np.random.seed(123)
+# np.random.seed(123)
 np.random.shuffle(files)
 
 # 仅选取 20 个文件（设置 np.random.seed(123) 时每次都会选中相同的文件）
-files = files[:100]
+# files = files[:100]
 
 # 按文件划分数据
 n_files = len(files)
@@ -142,7 +169,7 @@ for X, Y in zip(X_list_test, Y_list_test):
     X_win, Y_win = create_window(X, Y, window_size, step_size_test)
     X_test_win_list.append(X_win)
     Y_test_win_list.append(Y_win)
-
+# import ipdb ;ipdb.set_trace()
 
 # ------------------- DataLoader ------------------- #
 X_train_tensor = torch.tensor(X_train_win, dtype=torch.float32)
@@ -160,7 +187,24 @@ model = PoseLSTM().to(device)
 criterion = nn.MSELoss()
 optimizer = optim.Adam(model.parameters(), lr=learning_rate)
 
+b_model_path = os.path.join(models_dir, "best_model.pth")
+best_val = float("inf")
+best_epoch = -1
+# ------------------ 保存归一化参数 ----------------- #
+norm_params_path = os.path.join(models_dir, "norm_params.npz")
+np.savez(norm_params_path,
+         joints_mean=joints_mean, joints_std=joints_std)
+print(f"正規化パラメータを保存しました: {norm_params_path}")
+# ------------------ 保存测试数据 ------------------ #
+test_data_path = os.path.join(test_data_dir, "test_data.pkl")
+with open(test_data_path, "wb") as f:
+    pickle.dump({
+        "X_test_win_list": X_test_win_list,
+        "Y_test_win_list": Y_test_win_list
+    }, f)
+
 for epoch in range(epochs):
+    epoch_start = time.time()
     model.train()
     train_loss = 0.0
     for X_batch, Y_batch in train_loader:
@@ -184,37 +228,35 @@ for epoch in range(epochs):
             val_loss += loss.item() * X_batch.size(0)
     val_loss /= len(val_loader.dataset)
 
-    print(f"Epoch [{epoch+1}/{epochs}] Train Loss: {train_loss:.4f}  Val Loss: {val_loss:.4f}")
+    if val_loss < best_val:
+            best_val = val_loss
+            best_epoch = epoch + 1
+            torch.save(model.state_dict(), b_model_path)
+            wandb.log({"best_val_loss": best_val, "best_epoch": best_epoch})
+
+    epoch_time = time.time() - epoch_start
+    wandb.log({
+        "epoch": epoch + 1,
+        "train_loss": train_loss,
+        "val_loss": val_loss,
+        "lr": optimizer.param_groups[0]['lr'],
+        "epoch_time(s)": epoch_time
+    })
+
+    print(f"Epoch [{epoch+1}/{epochs}] "
+          f"Train Loss: {train_loss:.4f}  "
+          f"Val Loss: {val_loss:.4f}  "
+          f"Time: {epoch_time:.2f}s")
 
 
-# ------------------ 设置保存文件夹 ------------------ #
-base_dir = os.path.dirname(os.path.abspath(__file__))  # scripts 文件夹
-models_dir = os.path.join(base_dir, "../models")
-test_data_dir = os.path.join(base_dir, "../test_data")
-
-os.makedirs(models_dir, exist_ok=True)
-os.makedirs(test_data_dir, exist_ok=True)
-
-
-# ------------------ 保存归一化参数 ----------------- #
-norm_params_path = os.path.join(models_dir, "norm_params.npz")
-np.savez(norm_params_path,
-         joints_mean=joints_mean, joints_std=joints_std)
-print(f"正規化パラメータを保存しました: {norm_params_path}")
 
 
 # ------------------ 保存模型 ------------------ #
-model_path = os.path.join(models_dir, "best_model.pth")
+model_path = os.path.join(models_dir, "last_model.pth")
 torch.save(model.state_dict(), model_path)
 print(f"モデルを保存しました: {model_path}")
 
 
-# ------------------ 保存测试数据 ------------------ #
-test_data_path = os.path.join(test_data_dir, "test_data.pkl")
-with open(test_data_path, "wb") as f:
-    pickle.dump({
-        "X_test_win_list": X_test_win_list,
-        "Y_test_win_list": Y_test_win_list
-    }, f)
+
 
 print(f"テストデータを保存しました: {test_data_path}")

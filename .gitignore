@@ -1,0 +1,6 @@
+CMU/*.npz
+CMU/**/*.npz
+__pycache__/
+processed/
+processed_try/
+wandb/

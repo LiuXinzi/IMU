@@ -12,23 +12,23 @@ def denormalize(x_norm):
 
 # ------------------- 读取数据和模型 ------------------- #
 # 读取测试数据
-test_data_path = os.path.join("..", "test_data", "test_data.pkl")
+test_data_path = os.path.join( "test_data", "test_data.pkl")
 with open(test_data_path, "rb") as f:
     data = pickle.load(f)
-X_test_win_list = data["X_test_win_list"]
-Y_test_win_list = data["Y_test_win_list"]
+X_test_win_list = data["X_test_win_list"][:10]
+Y_test_win_list = data["Y_test_win_list"][:10]
 
 # 读取归一化参数
-norm_params_path = os.path.join("..", "models", "norm_params.npz")
+norm_params_path = os.path.join( "models", "norm_params.npz")
 norm = np.load(norm_params_path)
 joints_mean, joints_std = norm["joints_mean"], norm["joints_std"]
 
 # 读取模型
 model = PoseLSTM()
-model_path = os.path.join("..", "models", "best_model.pth")
+model_path = os.path.join( "models", "best_model.pth")
 weights = torch.load(model_path, map_location=torch.device("cpu"))   # 读取事先保存的权重
 model.load_state_dict(weights)
-
+# import ipdb;ipdb.set_trace()
 
 # ----------------- 将模型应用于全部测试数据 --------------------#
 true_joints_cm_list = []
@@ -66,7 +66,7 @@ print("すべてのテストデータを推定しました。")
 
 # ------------------ 设置保存文件夹 ------------------ #
 base_dir = os.path.dirname(os.path.abspath(__file__))  # scripts 文件夹
-results_dir = os.path.join(base_dir, "../results")
+results_dir = os.path.join(base_dir, "results")
 os.makedirs(results_dir, exist_ok=True)
 
 
@@ -87,7 +87,7 @@ print(f"すべての推定結果を保存しました: {results_path}")
 
 # ------------------ 误差评估 ------------------ #
 all_errors = []  # 将每个样本和关节的误差汇总
-
+# import ipdb;ipdb.set_trace()
 for true_joints_cm, pred_joints_cm in zip(true_joints_cm_list, pred_joints_cm_list):
     # shape: (N, 24, 3)
     diff = pred_joints_cm - true_joints_cm  # 差值
@@ -106,3 +106,7 @@ print("\n--- 推定精度評価 ---")
 print("関節ごとの平均誤差[cm]:", " ".join([f"{x:.2f}" for x in mae_per_joint]))
 print(f"全体の平均誤差: {mae_total:.2f} cm")
 print(f"誤差10cm以内の割合: {pck_10:.2f}%")
+
+# 関節ごとの平均誤差[cm]: 0.12 0.64 0.60 0.53 1.52 1.50 0.83 2.08 1.83 0.93 2.12 1.75 1.54 1.38 1.32 2.16 1.70 1.72 2.41 2.81 2.82 3.05 3.17 3.35
+# 全体の平均誤差: 1.75 cm
+# 誤差10cm以内の割合: 99.67%
