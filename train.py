@@ -173,7 +173,7 @@ for epoch in range(epochs):
         train_loss += loss.item() * X_batch.size(0)
     train_loss /= len(train_loader.dataset)
 
-    # 验证
+
     model.eval()
     val_loss = 0.0
     with torch.no_grad():
