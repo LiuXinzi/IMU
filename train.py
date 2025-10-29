@@ -1,262 +1,440 @@
-import os
+import json
 import time
+from pathlib import Path
+
 import numpy as np
-from sklearn.model_selection import train_test_split
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import TensorDataset, DataLoader
+from torch.utils.data import DataLoader, TensorDataset
 import wandb
-from model_def import PoseLSTM  # 从 “model_def.py” 文件中导入模型
-import pickle
+
+from model_def import PoseLSTM
 
 
 # ------------------- 超参数 ------------------- #
-TRAIN_RATIO = 0.9
-VAL_RATIO = 0.05
-window_size = 50
-step_size_train = 25
-step_size_test = 1
-batch_size = 1024
-epochs = 1000
-learning_rate = 1e-3
-# ------------------ 初始化 wandb ------------------ #
+TRAIN_RATIO = 0.85
+VAL_RATIO = 0.1
+WINDOW_SIZE = 30
+STEP_SIZE_TRAIN = 5
+STEP_SIZE_EVAL = 1
+BATCH_SIZE = 1024
+EPOCHS = 2000
+LEARNING_RATE = 1e-4
+RANDOM_SEED = 42
+
+
+# ------------------- WandB 初始化 ------------------- #
 wandb.init(
     project="Pose_LSTM",
-    name="PoseLSTM_run",
+    name="PoseLSTM_two_stage",
     config={
-        "epochs": epochs,
-        "batch_size": batch_size,
-        "learning_rate": learning_rate,
-        "window_size": window_size,
-        "step_size_train": step_size_train,
-        "model": "BiLSTM-2Layer-512Hidden",
+        "epochs": EPOCHS,
+        "batch_size": BATCH_SIZE,
+        "learning_rate": LEARNING_RATE,
+        "window_size": WINDOW_SIZE,
+        "step_size_train": STEP_SIZE_TRAIN,
+        "step_size_eval": STEP_SIZE_EVAL,
+        "model": "PoseLSTM-two-stage",
         "optimizer": "Adam",
-        "loss": "MSELoss"
-    }
+        "loss": "MSE(leaf) + MSE(full)",
+        "seed": RANDOM_SEED,
+    },
 )
 
-# ------------------ 设置保存文件夹 ------------------ #
-base_dir = os.path.dirname(os.path.abspath(__file__))  # scripts 文件夹
-models_dir = os.path.join(base_dir, "models")
-test_data_dir = os.path.join(base_dir, "test_data")
 
-os.makedirs(models_dir, exist_ok=True)
-os.makedirs(test_data_dir, exist_ok=True)
-
-
-# ------------------- 函数定义 ------------------- #
 def load_split(file_list):
-    acc_list, quat_list, joints_list = [], [], []
-    for fpath in file_list:
-        data = np.load(fpath)
-        acc_list.append(data["acc"])
-        quat_list.append(data["quat"])
-        joints_list.append(data["joints"])
-    return acc_list, quat_list, joints_list
+    acc_list, quat_list, joints_list, leaf_list = [], [], [], []
+    for path in file_list:
+        data = np.load(path)
+        acc_list.append(data["acc"].astype(np.float32))
+        quat_list.append(data["quat"].astype(np.float32))
+        joints_list.append(data["joints"].astype(np.float32))
+        leaf_list.append(data["leaf_pos"].astype(np.float32))
+    return acc_list, quat_list, joints_list, leaf_list
 
-def pelvis_relative(joints_list):
-    new_list = []
-    for joints in joints_list:
-        pelvis = joints[:, 0:1, :]
-        joints_rel = joints - pelvis
-        new_list.append(joints_rel)
-    return new_list
 
-def normalize(x, mean, std):
-    return (x - mean) / std
+def compute_norm_stats(data_list):
+    if not data_list:
+        raise ValueError("Empty data list when computing normalization statistics.")
+    feature_shape = data_list[0].shape[1:]
+    flat = np.concatenate(
+        [arr.reshape(arr.shape[0], -1) for arr in data_list],
+        axis=0,
+    )
+    mean = flat.mean(axis=0).reshape(feature_shape).astype(np.float32)
+    std = (flat.std(axis=0) + 1e-6).reshape(feature_shape).astype(np.float32)
+    return mean, std
 
-def create_window(X, Y, window_size, step_size):
-    X_windows, Y_windows = [], []
-    n_frames = X.shape[0]
-    X_flat = X.reshape(n_frames, -1)
-    Y_flat = Y.reshape(n_frames, -1)
-    for start in range(0, n_frames - window_size + 1, step_size):
+
+def normalize_list(data_list, mean, std):
+    flat_mean = mean.reshape(1, -1)
+    flat_std = std.reshape(1, -1)
+    normalized = []
+    for arr in data_list:
+        shape = arr.shape
+        flat = arr.reshape(shape[0], -1)
+        norm_flat = (flat - flat_mean) / flat_std
+        normalized.append(norm_flat.reshape(shape))
+    return normalized
+
+
+def create_windows(inputs, leaf, joints, window_size, step_size):
+    if inputs.shape[0] < window_size:
+        return np.empty((0, window_size, inputs.shape[1] * inputs.shape[2]), dtype=np.float32), \
+               np.empty((0, leaf.shape[1] * leaf.shape[2]), dtype=np.float32), \
+               np.empty((0, joints.shape[1] * joints.shape[2]), dtype=np.float32)
+
+    feature_dim = int(np.prod(inputs.shape[1:]))
+    leaf_dim = int(np.prod(leaf.shape[1:]))
+    joint_dim = int(np.prod(joints.shape[1:]))
+
+    inputs_flat = inputs.reshape(inputs.shape[0], feature_dim)
+    leaf_flat = leaf.reshape(leaf.shape[0], leaf_dim)
+    joints_flat = joints.reshape(joints.shape[0], joint_dim)
+
+    X_windows, leaf_targets, joint_targets = [], [], []
+    for start in range(0, inputs.shape[0] - window_size + 1, step_size):
         end = start + window_size
-        X_windows.append(X_flat[start:end])  # (window_size, feature_dim)
-        Y_windows.append(Y_flat[end - 1])    # 窗口的最后一帧
-    return np.array(X_windows), np.array(Y_windows)
+        X_windows.append(inputs_flat[start:end])
+        leaf_targets.append(leaf_flat[end - 1])
+        joint_targets.append(joints_flat[end - 1])
 
-def create_windows_from_lists(X_list, Y_list, window_size, step_size):
-    X_windows_all, Y_windows_all = [], []
-    for X, Y in zip(X_list, Y_list):
-        X_w, Y_w = create_window(X, Y, window_size, step_size)
-        if X_w.shape[0] != 0:
-            X_windows_all.append(X_w)
-            Y_windows_all.append(Y_w)
-    # 合并所有窗口
-    # import ipdb;ipdb.set_trace()
-    X_windows = np.concatenate(X_windows_all, axis=0)
-    Y_windows = np.concatenate(Y_windows_all, axis=0)
-    return X_windows, Y_windows
+    return (
+        np.stack(X_windows).astype(np.float32),
+        np.stack(leaf_targets).astype(np.float32),
+        np.stack(joint_targets).astype(np.float32),
+    )
 
 
-# ------------------- 数据读取与划分 ------------------- #
-processed_dir = "processed_try"
-files = [os.path.join(processed_dir, f) for f in os.listdir(processed_dir) if f.endswith(".npz")]
-# import ipdb;ipdb.set_trace()
-# 以文件为单位打乱顺序
-# np.random.seed(123)
-np.random.shuffle(files)
+def create_windows_from_lists(inputs_list, leaf_list, joints_list, window_size, step_size):
+    all_inputs, all_leaf, all_joints = [], [], []
+    for inputs, leaf, joints in zip(inputs_list, leaf_list, joints_list):
+        X_w, leaf_w, joints_w = create_windows(inputs, leaf, joints, window_size, step_size)
+        if X_w.size == 0:
+            continue
+        all_inputs.append(X_w)
+        all_leaf.append(leaf_w)
+        all_joints.append(joints_w)
 
-# 仅选取 20 个文件（设置 np.random.seed(123) 时每次都会选中相同的文件）
-# files = files[:100]
+    if not all_inputs:
+        return (
+            np.empty((0, window_size, inputs_list[0].shape[1] * inputs_list[0].shape[2]), dtype=np.float32),
+            np.empty((0, leaf_list[0].shape[1] * leaf_list[0].shape[2]), dtype=np.float32),
+            np.empty((0, joints_list[0].shape[1] * joints_list[0].shape[2]), dtype=np.float32),
+        )
 
-# 按文件划分数据
-n_files = len(files)
-n_train = int(n_files * TRAIN_RATIO)
-n_val = int(n_files * VAL_RATIO)
-train_files = files[:n_train]
-val_files = files[n_train:n_train+n_val]
-test_files = files[n_train+n_val:]
-print(f"trainファイル数: {len(train_files)}")
-print(f"valファイル数: {len(val_files)}")
-print(f"testファイル数: {len(test_files)}")
-
-# 读取并合并各个集合
-acc_list_train, quat_list_train, joints_list_train = load_split(train_files)
-acc_list_val, quat_list_val, joints_list_val       = load_split(val_files)
-acc_list_test, quat_list_test, joints_list_test    = load_split(test_files)
-
-# 相对于骨盆基准进行坐标转换
-joints_list_train = pelvis_relative(joints_list_train)
-joints_list_val   = pelvis_relative(joints_list_val)
-joints_list_test  = pelvis_relative(joints_list_test)
+    return (
+        np.concatenate(all_inputs, axis=0),
+        np.concatenate(all_leaf, axis=0),
+        np.concatenate(all_joints, axis=0),
+    )
 
 
-# ------------------- 归一化 ------------------- #
-# 仅为了计算整个训练集的均值和方差而拼接
-acc_all_train    = np.concatenate(acc_list_train, axis=0)
-quat_all_train   = np.concatenate(quat_list_train, axis=0)
-joints_all_train = np.concatenate(joints_list_train, axis=0)
-
-acc_mean, acc_std       = acc_all_train.mean(axis=(0, 1)), acc_all_train.std(axis=(0, 1)) + 1e-6
-quat_mean, quat_std     = quat_all_train.mean(axis=(0, 1)), quat_all_train.std(axis=(0, 1)) + 1e-6
-joints_mean, joints_std = joints_all_train.mean(axis=(0, 1)), joints_all_train.std(axis=(0, 1)) + 1e-6
-
-# 对每个文件做归一化（保持边界）
-acc_list_train = [normalize(a, acc_mean, acc_std) for a in acc_list_train]
-acc_list_val   = [normalize(a, acc_mean, acc_std) for a in acc_list_val]
-acc_list_test  = [normalize(a, acc_mean, acc_std) for a in acc_list_test]
-
-quat_list_train = [normalize(q, quat_mean, quat_std) for q in quat_list_train]
-quat_list_val   = [normalize(q, quat_mean, quat_std) for q in quat_list_val]
-quat_list_test  = [normalize(q, quat_mean, quat_std) for q in quat_list_test]
-
-joints_list_train = [normalize(j, joints_mean, joints_std) for j in joints_list_train]
-joints_list_val   = [normalize(j, joints_mean, joints_std) for j in joints_list_val]
-joints_list_test  = [normalize(j, joints_mean, joints_std) for j in joints_list_test]
+def build_inputs(acc_list, quat_list):
+    return [np.concatenate([acc, quat], axis=-1) for acc, quat in zip(acc_list, quat_list)]
 
 
-# ------------------- 构建 X 和 Y ------------------- #
-# X : acc + quat
-X_list_train = [np.concatenate([a, q], axis=-1) for a, q in zip(acc_list_train, quat_list_train)]
-X_list_val   = [np.concatenate([a, q], axis=-1) for a, q in zip(acc_list_val, quat_list_val)]
-X_list_test  = [np.concatenate([a, q], axis=-1) for a, q in zip(acc_list_test, quat_list_test)]
-# Y : joints
-Y_list_train = joints_list_train
-Y_list_val   = joints_list_val
-Y_list_test  = joints_list_test
-
-# flatten((N, 6, 7) → (N, 42)) → 构建窗口
-X_train_win, Y_train_win = create_windows_from_lists(X_list_train, Y_list_train, window_size, step_size_train)
-X_val_win, Y_val_win     = create_windows_from_lists(X_list_val, Y_list_val, window_size, step_size_train)
-
-# 测试用的 X、Y 想按动作可视化，因此保持列表并按窗口划分
-X_test_win_list, Y_test_win_list = [], []
-for X, Y in zip(X_list_test, Y_list_test):
-    # 扁平化后生成窗口
-    X_win, Y_win = create_window(X, Y, window_size, step_size_test)
-    X_test_win_list.append(X_win)
-    Y_test_win_list.append(Y_win)
-# import ipdb ;ipdb.set_trace()
-
-# ------------------- DataLoader ------------------- #
-X_train_tensor = torch.tensor(X_train_win, dtype=torch.float32)
-Y_train_tensor = torch.tensor(Y_train_win, dtype=torch.float32)
-X_val_tensor   = torch.tensor(X_val_win, dtype=torch.float32)
-Y_val_tensor   = torch.tensor(Y_val_win, dtype=torch.float32)
-
-train_loader = DataLoader(TensorDataset(X_train_tensor, Y_train_tensor), batch_size=batch_size, shuffle=True)
-val_loader   = DataLoader(TensorDataset(X_val_tensor, Y_val_tensor), batch_size=batch_size, shuffle=False)
+def set_seed(seed):
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
-# ------------------- 训练 ------------------- #
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model = PoseLSTM().to(device)
-criterion = nn.MSELoss()
-optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+def main():
+    set_seed(RANDOM_SEED)
 
-b_model_path = os.path.join(models_dir, "best_model.pth")
-best_val = float("inf")
-best_epoch = -1
-# ------------------ 保存归一化参数 ----------------- #
-norm_params_path = os.path.join(models_dir, "norm_params.npz")
-np.savez(norm_params_path,
-         joints_mean=joints_mean, joints_std=joints_std)
-print(f"正規化パラメータを保存しました: {norm_params_path}")
-# ------------------ 保存测试数据 ------------------ #
-test_data_path = os.path.join(test_data_dir, "test_data.pkl")
-with open(test_data_path, "wb") as f:
-    pickle.dump({
-        "X_test_win_list": X_test_win_list,
-        "Y_test_win_list": Y_test_win_list
-    }, f)
+    base_dir = Path(__file__).resolve().parent
+    processed_dir = base_dir / "processed_KIT"
+    models_dir = base_dir / "models_KIT"
+    test_data_dir = models_dir / "test_data"
 
-for epoch in range(epochs):
-    epoch_start = time.time()
-    model.train()
-    train_loss = 0.0
-    for X_batch, Y_batch in train_loader:
-        X_batch, Y_batch = X_batch.to(device), Y_batch.to(device)
-        optimizer.zero_grad()
-        outputs = model(X_batch)
-        loss = criterion(outputs, Y_batch)
-        loss.backward()
-        optimizer.step()
-        train_loss += loss.item() * X_batch.size(0)
-    train_loss /= len(train_loader.dataset)
+    models_dir.mkdir(parents=True, exist_ok=True)
+    test_data_dir.mkdir(parents=True, exist_ok=True)
+
+    files = sorted(processed_dir.glob("*.npz"))
+    if not files:
+        raise FileNotFoundError(f"No processed files found in {processed_dir}")
+
+    rng = np.random.default_rng(RANDOM_SEED)
+    files = list(files)
+    rng.shuffle(files)
+
+    n_files = len(files)
+    n_train = max(1, int(n_files * TRAIN_RATIO))
+    n_val = max(1, int(n_files * VAL_RATIO))
+    n_test = max(1, n_files - n_train - n_val)
+
+    train_files = files[:n_train]
+    val_files = files[n_train:n_train + n_val]
+    test_files = files[n_train + n_val:]
+
+    # 确保至少有一个测试文件
+    if not test_files:
+        test_files = val_files[-1:]
+        val_files = val_files[:-1]
+
+    print(f"train文件数: {len(train_files)}")
+    print(f"val文件数: {len(val_files)}")
+    print(f"test文件数: {len(test_files)}")
+
+    acc_tr, quat_tr, joints_tr, leaf_tr = load_split(train_files)
+    acc_val, quat_val, joints_val, leaf_val = load_split(val_files)
+    acc_te, quat_te, joints_te, leaf_te = load_split(test_files)
+
+    acc_mean, acc_std = compute_norm_stats(acc_tr)
+    quat_mean, quat_std = compute_norm_stats(quat_tr)
+    leaf_mean, leaf_std = compute_norm_stats(leaf_tr)
+    joints_mean, joints_std = compute_norm_stats(joints_tr)
+
+    acc_tr = normalize_list(acc_tr, acc_mean, acc_std)
+    acc_val = normalize_list(acc_val, acc_mean, acc_std)
+    acc_te = normalize_list(acc_te, acc_mean, acc_std)
+
+    quat_tr = normalize_list(quat_tr, quat_mean, quat_std)
+    quat_val = normalize_list(quat_val, quat_mean, quat_std)
+    quat_te = normalize_list(quat_te, quat_mean, quat_std)
+
+    leaf_tr = normalize_list(leaf_tr, leaf_mean, leaf_std)
+    leaf_val = normalize_list(leaf_val, leaf_mean, leaf_std)
+    leaf_te = normalize_list(leaf_te, leaf_mean, leaf_std)
+
+    joints_tr = normalize_list(joints_tr, joints_mean, joints_std)
+    joints_val = normalize_list(joints_val, joints_mean, joints_std)
+    joints_te = normalize_list(joints_te, joints_mean, joints_std)
+
+    inputs_tr = build_inputs(acc_tr, quat_tr)
+    inputs_val = build_inputs(acc_val, quat_val)
+    inputs_te = build_inputs(acc_te, quat_te)
+
+    X_train, leaf_train, joints_train = create_windows_from_lists(
+        inputs_tr, leaf_tr, joints_tr, WINDOW_SIZE, STEP_SIZE_TRAIN
+    )
+    X_val, leaf_val_target, joints_val_target = create_windows_from_lists(
+        inputs_val, leaf_val, joints_val, WINDOW_SIZE, STEP_SIZE_TRAIN
+    )
+
+    X_test_list, leaf_test_list, joints_test_list = [], [], []
+    for inputs, leaf, joints in zip(inputs_te, leaf_te, joints_te):
+        # 使用 STEP_SIZE_EVAL=1 构建滑动窗口，确保推理阶段能得到连续的逐帧输出
+        X_w, leaf_w, joints_w = create_windows(inputs, leaf, joints, WINDOW_SIZE, STEP_SIZE_EVAL)
+        X_test_list.append(X_w)
+        leaf_test_list.append(leaf_w)
+        joints_test_list.append(joints_w)
+
+    if X_train.size == 0:
+        raise RuntimeError("No training windows were generated. Check window_size and STEP_SIZE_TRAIN.")
+
+    train_dataset = TensorDataset(
+        torch.from_numpy(X_train),
+        torch.from_numpy(leaf_train),
+        torch.from_numpy(joints_train),
+    )
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, drop_last=False)
+
+    val_loader = None
+    if X_val.size > 0:
+        val_dataset = TensorDataset(
+            torch.from_numpy(X_val),
+            torch.from_numpy(leaf_val_target),
+            torch.from_numpy(joints_val_target),
+        )
+        val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, drop_last=False)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    input_size = X_train.shape[-1]
+    leaf_size = leaf_train.shape[-1]
+    joint_size = joints_train.shape[-1]
+
+    model = PoseLSTM(
+        input_size=input_size,
+        leaf_output_size=leaf_size,
+        full_output_size=joint_size,
+    ).to(device)
+
+    criterion = nn.MSELoss(reduction="sum")
+    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
+
+    best_val = None
+    best_epoch = None
+    best_model_path = models_dir / "best_model.pth"
+
+    for epoch in range(EPOCHS):
+        epoch_start = time.time()
+        model.train()
+        train_leaf_loss = 0.0
+        train_full_loss = 0.0
+
+        for X_batch, leaf_batch, joint_batch in train_loader:
+            X_batch = X_batch.to(device)
+            leaf_batch = leaf_batch.to(device)
+            joint_batch = joint_batch.to(device)
+
+            optimizer.zero_grad()
+            leaf_pred, full_pred = model(X_batch)
+            leaf_loss = criterion(leaf_pred, leaf_batch)
+            full_loss = criterion(full_pred, joint_batch)
+            loss = leaf_loss + full_loss
+            loss.backward()
+            optimizer.step()
+
+            train_leaf_loss += leaf_loss.item()
+            train_full_loss += full_loss.item()
+
+        train_leaf_loss /= len(train_loader)
+        train_full_loss /= len(train_loader)
+        train_total_loss = train_leaf_loss + train_full_loss
+
+        val_leaf_loss = None
+        val_full_loss = None
+        val_total_loss = None
+
+        if val_loader is not None:
+            model.eval()
+            val_leaf_loss = 0.0
+            val_full_loss = 0.0
+            with torch.no_grad():
+                for X_batch, leaf_batch, joint_batch in val_loader:
+                    X_batch = X_batch.to(device)
+                    leaf_batch = leaf_batch.to(device)
+                    joint_batch = joint_batch.to(device)
+                    leaf_pred, full_pred = model(X_batch)
+                    leaf_loss = criterion(leaf_pred, leaf_batch)
+                    full_loss = criterion(full_pred, joint_batch)
+                    val_leaf_loss += leaf_loss.item()
+                    val_full_loss += full_loss.item()
+
+            val_leaf_loss /= len(val_loader)
+            val_full_loss /= len(val_loader)
+            val_total_loss = val_leaf_loss + val_full_loss
+
+            if best_val is None or val_total_loss < best_val:
+                best_val = val_total_loss
+                best_epoch = epoch + 1
+                torch.save(model.state_dict(), best_model_path)
+                wandb.log({
+                    "best_epoch": best_epoch,
+                    "best_val_total_loss": best_val,
+                    "best_val_leaf_loss": val_leaf_loss,
+                    "best_val_full_loss": val_full_loss,
+                })
+
+        epoch_time = time.time() - epoch_start
+        log_dict = {
+            "epoch": epoch + 1,
+            "train_leaf_loss": train_leaf_loss,
+            "train_full_loss": train_full_loss,
+            "train_total_loss": train_total_loss,
+            "epoch_time_s": epoch_time,
+            "lr": optimizer.param_groups[0]["lr"],
+        }
+        if val_total_loss is not None:
+            log_dict.update({
+                "val_leaf_loss": val_leaf_loss,
+                "val_full_loss": val_full_loss,
+                "val_total_loss": val_total_loss,
+            })
+        wandb.log(log_dict)
+
+        msg = (
+            f"Epoch [{epoch + 1}/{EPOCHS}] "
+            f"TrainLeaf: {train_leaf_loss:.4f}  "
+            f"TrainFull: {train_full_loss:.4f}  "
+            f"TrainTotal: {train_total_loss:.4f}  "
+        )
+        if val_total_loss is not None:
+            msg += (
+                f"ValLeaf: {val_leaf_loss:.4f}  "
+                f"ValFull: {val_full_loss:.4f}  "
+                f"ValTotal: {val_total_loss:.4f}  "
+            )
+        msg += f"Time: {epoch_time:.2f}s"
+        print(msg)
+
+    last_model_path = models_dir / "last_model.pth"
+    torch.save(model.state_dict(), last_model_path)
+
+    norm_params_path = models_dir / "norm_params.npz"
+    np.savez(
+        norm_params_path,
+        acc_mean=acc_mean,
+        acc_std=acc_std,
+        quat_mean=quat_mean,
+        quat_std=quat_std,
+        leaf_mean=leaf_mean,
+        leaf_std=leaf_std,
+        joints_mean=joints_mean,
+        joints_std=joints_std,
+    )
+
+    test_sequences = []
+    for path, X_w, leaf_w, joints_w in zip(test_files, X_test_list, leaf_test_list, joints_test_list):
+        if X_w.size == 0:
+            continue
+        test_sequences.append({
+            "file": str(path),
+            "inputs": torch.from_numpy(X_w),
+            "leaf": torch.from_numpy(leaf_w),
+            "joints": torch.from_numpy(joints_w),
+        })
+
+    train_sequences = []
+    for path, inputs, leaf, joints in zip(train_files, inputs_tr, leaf_tr, joints_tr):
+        X_w, leaf_w, joints_w = create_windows(inputs, leaf, joints, WINDOW_SIZE, STEP_SIZE_EVAL)
+        if X_w.size == 0:
+            continue
+        train_sequences.append({
+            "file": str(path),
+            "inputs": torch.from_numpy(X_w),
+            "leaf": torch.from_numpy(leaf_w),
+            "joints": torch.from_numpy(joints_w),
+        })
+
+    test_data_path = test_data_dir / "test_sequences.pt"
+    torch.save({
+        "window_size": WINDOW_SIZE,
+        "step_size": STEP_SIZE_EVAL,
+        "sequences": test_sequences,
+    }, test_data_path)
+
+    train_data_path = test_data_dir / "train_sequences.pt"
+    torch.save({
+        "window_size": WINDOW_SIZE,
+        "step_size": STEP_SIZE_EVAL,
+        "sequences": train_sequences,
+    }, train_data_path)
+
+    summary_path = models_dir / "training_summary.json"
+    summary = {
+        "train_files": [str(p) for p in train_files],
+        "val_files": [str(p) for p in val_files],
+        "test_files": [str(p) for p in test_files],
+        "best_epoch": best_epoch,
+        "best_val_total_loss": best_val,
+        "last_model_path": str(last_model_path),
+        "best_model_path": str(best_model_path),
+        "norm_params_path": str(norm_params_path),
+        "test_data_path": str(test_data_path),
+        "train_data_path": str(train_data_path),
+        "hyperparameters": {
+            "window_size": WINDOW_SIZE,
+            "step_size_train": STEP_SIZE_TRAIN,
+            "step_size_eval": STEP_SIZE_EVAL,
+            "batch_size": BATCH_SIZE,
+            "epochs": EPOCHS,
+            "learning_rate": LEARNING_RATE,
+        },
+    }
+    with open(summary_path, "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2)
+
+    print(f"Best model saved to: {best_model_path}")
+    print(f"Last model saved to: {last_model_path}")
+    print(f"Normalization parameters saved to: {norm_params_path}")
+    print(f"Test sequences saved to: {test_data_path}")
+    print(f"Training summary saved to: {summary_path}")
 
 
-    model.eval()
-    val_loss = 0.0
-    with torch.no_grad():
-        for X_batch, Y_batch in val_loader:
-            X_batch, Y_batch = X_batch.to(device), Y_batch.to(device)
-            outputs = model(X_batch)
-            loss = criterion(outputs, Y_batch)
-            val_loss += loss.item() * X_batch.size(0)
-    val_loss /= len(val_loader.dataset)
-
-    if val_loss < best_val:
-            best_val = val_loss
-            best_epoch = epoch + 1
-            torch.save(model.state_dict(), b_model_path)
-            wandb.log({"best_val_loss": best_val, "best_epoch": best_epoch})
-
-    epoch_time = time.time() - epoch_start
-    wandb.log({
-        "epoch": epoch + 1,
-        "train_loss": train_loss,
-        "val_loss": val_loss,
-        "lr": optimizer.param_groups[0]['lr'],
-        "epoch_time(s)": epoch_time
-    })
-
-    print(f"Epoch [{epoch+1}/{epochs}] "
-          f"Train Loss: {train_loss:.4f}  "
-          f"Val Loss: {val_loss:.4f}  "
-          f"Time: {epoch_time:.2f}s")
-
-
-
-
-# ------------------ 保存模型 ------------------ #
-model_path = os.path.join(models_dir, "last_model.pth")
-torch.save(model.state_dict(), model_path)
-print(f"モデルを保存しました: {model_path}")
-
-
-
-
-print(f"テストデータを保存しました: {test_data_path}")
+if __name__ == "__main__":
+    main()
