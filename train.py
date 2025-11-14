@@ -13,14 +13,18 @@ from model_def import PoseLSTM
 
 
 # ------------------- 超参数 ------------------- #
-TRAIN_RATIO = 0.85
-VAL_RATIO = 0.1
-WINDOW_SIZE = 30
-STEP_SIZE_TRAIN = 5
+TRAIN_RATIO = 0.8
+VAL_RATIO = 0.15
+NUM_PAST_FRAME = 30
+NUM_FUTURE_FRAME = 5
+WINDOW_SIZE = NUM_PAST_FRAME + NUM_FUTURE_FRAME + 1
+CENTER_INDEX = NUM_PAST_FRAME
+STEP_SIZE_TRAIN = 1
 STEP_SIZE_EVAL = 1
-BATCH_SIZE = 1024
-EPOCHS = 2000
-LEARNING_RATE = 1e-4
+BATCH_SIZE = 128
+EPOCHS = 100
+LEARNING_RATE = 2e-4
+L2_LAMBDA = 1e-4
 RANDOM_SEED = 42
 
 
@@ -33,12 +37,14 @@ wandb.init(
         "batch_size": BATCH_SIZE,
         "learning_rate": LEARNING_RATE,
         "window_size": WINDOW_SIZE,
+        "center_index": CENTER_INDEX,
         "step_size_train": STEP_SIZE_TRAIN,
         "step_size_eval": STEP_SIZE_EVAL,
         "model": "PoseLSTM-two-stage",
-        "optimizer": "Adam",
+        "optimizer": "AdamW",
         "loss": "MSE(leaf) + MSE(full)",
         "seed": RANDOM_SEED,
+        "l2_lambda": L2_LAMBDA,
     },
 )
 
@@ -79,49 +85,58 @@ def normalize_list(data_list, mean, std):
     return normalized
 
 
-def create_windows(inputs, leaf, joints, window_size, step_size):
+def flatten_sequences(seq_list):
+    return [seq.reshape(seq.shape[0], -1) for seq in seq_list]
+
+
+def create_windows(inputs, leaf, joints, window_size, center_idx, step_size, return_centers=False):
     if inputs.shape[0] < window_size:
-        return np.empty((0, window_size, inputs.shape[1] * inputs.shape[2]), dtype=np.float32), \
-               np.empty((0, leaf.shape[1] * leaf.shape[2]), dtype=np.float32), \
-               np.empty((0, joints.shape[1] * joints.shape[2]), dtype=np.float32)
+        empty_inputs = np.empty((0, window_size, inputs.shape[1]), dtype=np.float32)
+        empty_leaf = np.empty((0, leaf.shape[1]), dtype=np.float32)
+        empty_joints = np.empty((0, joints.shape[1]), dtype=np.float32)
+        if return_centers:
+            return empty_inputs, empty_leaf, empty_joints, np.empty((0,), dtype=np.int64)
+        return empty_inputs, empty_leaf, empty_joints
 
-    feature_dim = int(np.prod(inputs.shape[1:]))
-    leaf_dim = int(np.prod(leaf.shape[1:]))
-    joint_dim = int(np.prod(joints.shape[1:]))
-
-    inputs_flat = inputs.reshape(inputs.shape[0], feature_dim)
-    leaf_flat = leaf.reshape(leaf.shape[0], leaf_dim)
-    joints_flat = joints.reshape(joints.shape[0], joint_dim)
-
-    X_windows, leaf_targets, joint_targets = [], [], []
+    windows, leaf_targets, joint_targets, centers = [], [], [], []
     for start in range(0, inputs.shape[0] - window_size + 1, step_size):
         end = start + window_size
-        X_windows.append(inputs_flat[start:end])
-        leaf_targets.append(leaf_flat[end - 1])
-        joint_targets.append(joints_flat[end - 1])
+        center = start + center_idx
+        windows.append(inputs[start:end])
+        leaf_targets.append(leaf[center])
+        joint_targets.append(joints[center])
+        centers.append(center)
 
-    return (
-        np.stack(X_windows).astype(np.float32),
-        np.stack(leaf_targets).astype(np.float32),
-        np.stack(joint_targets).astype(np.float32),
-    )
+    windows = np.stack(windows).astype(np.float32)
+    leaf_targets = np.stack(leaf_targets).astype(np.float32)
+    joint_targets = np.stack(joint_targets).astype(np.float32)
+    centers = np.asarray(centers, dtype=np.int64)
+
+    if return_centers:
+        return windows, leaf_targets, joint_targets, centers
+    return windows, leaf_targets, joint_targets
 
 
-def create_windows_from_lists(inputs_list, leaf_list, joints_list, window_size, step_size):
+def create_windows_from_lists(inputs_list, leaf_list, joints_list, window_size, center_idx, step_size):
     all_inputs, all_leaf, all_joints = [], [], []
     for inputs, leaf, joints in zip(inputs_list, leaf_list, joints_list):
-        X_w, leaf_w, joints_w = create_windows(inputs, leaf, joints, window_size, step_size)
-        if X_w.size == 0:
+        windows, leaf_targets, joint_targets = create_windows(
+            inputs, leaf, joints, window_size, center_idx, step_size
+        )
+        if windows.shape[0] == 0:
             continue
-        all_inputs.append(X_w)
-        all_leaf.append(leaf_w)
-        all_joints.append(joints_w)
+        all_inputs.append(windows)
+        all_leaf.append(leaf_targets)
+        all_joints.append(joint_targets)
 
     if not all_inputs:
+        feature_dim = inputs_list[0].shape[1]
+        leaf_dim = leaf_list[0].shape[1]
+        joint_dim = joints_list[0].shape[1]
         return (
-            np.empty((0, window_size, inputs_list[0].shape[1] * inputs_list[0].shape[2]), dtype=np.float32),
-            np.empty((0, leaf_list[0].shape[1] * leaf_list[0].shape[2]), dtype=np.float32),
-            np.empty((0, joints_list[0].shape[1] * joints_list[0].shape[2]), dtype=np.float32),
+            np.empty((0, window_size, feature_dim), dtype=np.float32),
+            np.empty((0, leaf_dim), dtype=np.float32),
+            np.empty((0, joint_dim), dtype=np.float32),
         )
 
     return (
@@ -132,7 +147,11 @@ def create_windows_from_lists(inputs_list, leaf_list, joints_list, window_size, 
 
 
 def build_inputs(acc_list, quat_list):
-    return [np.concatenate([acc, quat], axis=-1) for acc, quat in zip(acc_list, quat_list)]
+    inputs = []
+    for acc, quat in zip(acc_list, quat_list):
+        combined = np.concatenate([acc, quat], axis=-1)
+        inputs.append(combined.reshape(combined.shape[0], -1))
+    return inputs
 
 
 def set_seed(seed):
@@ -146,8 +165,8 @@ def main():
     set_seed(RANDOM_SEED)
 
     base_dir = Path(__file__).resolve().parent
-    processed_dir = base_dir / "processed_KIT"
-    models_dir = base_dir / "models_KIT"
+    processed_dir = base_dir / "processed_CMU"
+    models_dir = base_dir / "models_CMU"
     test_data_dir = models_dir / "test_data"
 
     models_dir.mkdir(parents=True, exist_ok=True)
@@ -208,23 +227,33 @@ def main():
     inputs_val = build_inputs(acc_val, quat_val)
     inputs_te = build_inputs(acc_te, quat_te)
 
+    leaf_tr_flat = flatten_sequences(leaf_tr)
+    leaf_val_flat = flatten_sequences(leaf_val)
+    leaf_te_flat = flatten_sequences(leaf_te)
+
+    joints_tr_flat = flatten_sequences(joints_tr)
+    joints_val_flat = flatten_sequences(joints_val)
+    joints_te_flat = flatten_sequences(joints_te)
+
     X_train, leaf_train, joints_train = create_windows_from_lists(
-        inputs_tr, leaf_tr, joints_tr, WINDOW_SIZE, STEP_SIZE_TRAIN
+        inputs_tr, leaf_tr_flat, joints_tr_flat, WINDOW_SIZE, CENTER_INDEX, STEP_SIZE_TRAIN
     )
+    if X_train.shape[0] == 0:
+        raise RuntimeError("No training windows generated. Check window parameters.")
+
     X_val, leaf_val_target, joints_val_target = create_windows_from_lists(
-        inputs_val, leaf_val, joints_val, WINDOW_SIZE, STEP_SIZE_TRAIN
+        inputs_val, leaf_val_flat, joints_val_flat, WINDOW_SIZE, CENTER_INDEX, STEP_SIZE_TRAIN
     )
 
-    X_test_list, leaf_test_list, joints_test_list = [], [], []
-    for inputs, leaf, joints in zip(inputs_te, leaf_te, joints_te):
-        # 使用 STEP_SIZE_EVAL=1 构建滑动窗口，确保推理阶段能得到连续的逐帧输出
-        X_w, leaf_w, joints_w = create_windows(inputs, leaf, joints, WINDOW_SIZE, STEP_SIZE_EVAL)
+    X_test_list, leaf_test_list, joints_test_list, center_test_list = [], [], [], []
+    for inputs, leaf, joints in zip(inputs_te, leaf_te_flat, joints_te_flat):
+        X_w, leaf_w, joints_w, centers = create_windows(
+            inputs, leaf, joints, WINDOW_SIZE, CENTER_INDEX, STEP_SIZE_EVAL, return_centers=True
+        )
         X_test_list.append(X_w)
         leaf_test_list.append(leaf_w)
         joints_test_list.append(joints_w)
-
-    if X_train.size == 0:
-        raise RuntimeError("No training windows were generated. Check window_size and STEP_SIZE_TRAIN.")
+        center_test_list.append(centers)
 
     train_dataset = TensorDataset(
         torch.from_numpy(X_train),
@@ -234,7 +263,7 @@ def main():
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, drop_last=False)
 
     val_loader = None
-    if X_val.size > 0:
+    if X_val.shape[0] > 0:
         val_dataset = TensorDataset(
             torch.from_numpy(X_val),
             torch.from_numpy(leaf_val_target),
@@ -254,7 +283,7 @@ def main():
     ).to(device)
 
     criterion = nn.MSELoss(reduction="sum")
-    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=L2_LAMBDA)
 
     best_val = None
     best_epoch = None
@@ -265,6 +294,7 @@ def main():
         model.train()
         train_leaf_loss = 0.0
         train_full_loss = 0.0
+        train_samples = 0
 
         for X_batch, leaf_batch, joint_batch in train_loader:
             X_batch = X_batch.to(device)
@@ -272,7 +302,9 @@ def main():
             joint_batch = joint_batch.to(device)
 
             optimizer.zero_grad()
-            leaf_pred, full_pred = model(X_batch)
+            leaf_seq, full_seq = model(X_batch)
+            leaf_pred = leaf_seq[:, CENTER_INDEX]
+            full_pred = full_seq[:, CENTER_INDEX]
             leaf_loss = criterion(leaf_pred, leaf_batch)
             full_loss = criterion(full_pred, joint_batch)
             loss = leaf_loss + full_loss
@@ -281,9 +313,10 @@ def main():
 
             train_leaf_loss += leaf_loss.item()
             train_full_loss += full_loss.item()
+            train_samples += leaf_batch.size(0)
 
-        train_leaf_loss /= len(train_loader)
-        train_full_loss /= len(train_loader)
+        train_leaf_loss /= train_samples
+        train_full_loss /= train_samples
         train_total_loss = train_leaf_loss + train_full_loss
 
         val_leaf_loss = None
@@ -294,19 +327,23 @@ def main():
             model.eval()
             val_leaf_loss = 0.0
             val_full_loss = 0.0
+            val_samples = 0
             with torch.no_grad():
                 for X_batch, leaf_batch, joint_batch in val_loader:
                     X_batch = X_batch.to(device)
                     leaf_batch = leaf_batch.to(device)
                     joint_batch = joint_batch.to(device)
-                    leaf_pred, full_pred = model(X_batch)
+                    leaf_seq, full_seq = model(X_batch)
+                    leaf_pred = leaf_seq[:, CENTER_INDEX]
+                    full_pred = full_seq[:, CENTER_INDEX]
                     leaf_loss = criterion(leaf_pred, leaf_batch)
                     full_loss = criterion(full_pred, joint_batch)
                     val_leaf_loss += leaf_loss.item()
                     val_full_loss += full_loss.item()
+                    val_samples += leaf_batch.size(0)
 
-            val_leaf_loss /= len(val_loader)
-            val_full_loss /= len(val_loader)
+            val_leaf_loss /= val_samples
+            val_full_loss /= val_samples
             val_total_loss = val_leaf_loss + val_full_loss
 
             if best_val is None or val_total_loss < best_val:
@@ -369,7 +406,8 @@ def main():
     )
 
     test_sequences = []
-    for path, X_w, leaf_w, joints_w in zip(test_files, X_test_list, leaf_test_list, joints_test_list):
+    for path, X_w, leaf_w, joints_w, centers in zip(
+            test_files, X_test_list, leaf_test_list, joints_test_list, center_test_list):
         if X_w.size == 0:
             continue
         test_sequences.append({
@@ -377,11 +415,14 @@ def main():
             "inputs": torch.from_numpy(X_w),
             "leaf": torch.from_numpy(leaf_w),
             "joints": torch.from_numpy(joints_w),
+            "centers": torch.from_numpy(centers),
         })
 
     train_sequences = []
-    for path, inputs, leaf, joints in zip(train_files, inputs_tr, leaf_tr, joints_tr):
-        X_w, leaf_w, joints_w = create_windows(inputs, leaf, joints, WINDOW_SIZE, STEP_SIZE_EVAL)
+    for path, inputs, leaf, joints in zip(train_files, inputs_tr, leaf_tr_flat, joints_tr_flat):
+        X_w, leaf_w, joints_w, centers = create_windows(
+            inputs, leaf, joints, WINDOW_SIZE, CENTER_INDEX, STEP_SIZE_EVAL, return_centers=True
+        )
         if X_w.size == 0:
             continue
         train_sequences.append({
@@ -389,11 +430,13 @@ def main():
             "inputs": torch.from_numpy(X_w),
             "leaf": torch.from_numpy(leaf_w),
             "joints": torch.from_numpy(joints_w),
+            "centers": torch.from_numpy(centers),
         })
 
     test_data_path = test_data_dir / "test_sequences.pt"
     torch.save({
         "window_size": WINDOW_SIZE,
+        "center_index": CENTER_INDEX,
         "step_size": STEP_SIZE_EVAL,
         "sequences": test_sequences,
     }, test_data_path)
@@ -401,6 +444,7 @@ def main():
     train_data_path = test_data_dir / "train_sequences.pt"
     torch.save({
         "window_size": WINDOW_SIZE,
+        "center_index": CENTER_INDEX,
         "step_size": STEP_SIZE_EVAL,
         "sequences": train_sequences,
     }, train_data_path)
@@ -419,11 +463,13 @@ def main():
         "train_data_path": str(train_data_path),
         "hyperparameters": {
             "window_size": WINDOW_SIZE,
+            "center_index": CENTER_INDEX,
             "step_size_train": STEP_SIZE_TRAIN,
             "step_size_eval": STEP_SIZE_EVAL,
             "batch_size": BATCH_SIZE,
             "epochs": EPOCHS,
             "learning_rate": LEARNING_RATE,
+            "l2_lambda": L2_LAMBDA,
         },
     }
     with open(summary_path, "w", encoding="utf-8") as f:
@@ -433,6 +479,7 @@ def main():
     print(f"Last model saved to: {last_model_path}")
     print(f"Normalization parameters saved to: {norm_params_path}")
     print(f"Test sequences saved to: {test_data_path}")
+    print(f"Train sequences saved to: {train_data_path}")
     print(f"Training summary saved to: {summary_path}")
 
 

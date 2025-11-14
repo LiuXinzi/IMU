@@ -6,7 +6,7 @@ class RNN(nn.Module):
     """
     A lightweight wrapper consisting of a linear input projection, an LSTM stack,
     and a linear output projection. Operates on sequences with shape
-    (batch, seq_len, feature_dim) and returns the final-step prediction.
+    (batch, seq_len, feature_dim) and returns per-step predictions.
     """
     def __init__(self, n_input, n_output, n_hidden,
                  n_rnn_layer=2, bidirectional=True, dropout=0.2):
@@ -27,13 +27,13 @@ class RNN(nn.Module):
         Args:
             x: Tensor of shape (batch, seq_len, n_input)
         Returns:
-            output: Tensor of shape (batch, n_output) for the last time step.
+            output: Tensor of shape (batch, seq_len, n_output).
         """
         y = torch.relu(self.input_proj(self.dropout(x)))
-        y = self.dropout(y)
+        # y = self.dropout(y)
         y, h = self.rnn(y, h)
-        last_step = y[:, -1]
-        output = self.output_proj(self.dropout(last_step))
+        # y = self.dropout(y)
+        output = self.output_proj(y)
         return output, h
 
 
@@ -59,11 +59,15 @@ class PoseLSTM(nn.Module):
         Args:
             x: Tensor of shape (batch, seq_len, input_size)
         Returns:
-            leaf_pred: (batch, leaf_output_size)
-            full_pred: (batch, full_output_size)
+            leaf_pred: (batch, seq_len, leaf_output_size)
+            full_pred: (batch, seq_len, full_output_size)
         """
-        leaf_pred, _ = self.net1(x)
-        leaf_seq = leaf_pred.unsqueeze(1).expand(-1, x.size(1), -1)
-        net2_input = torch.cat((x, leaf_seq), dim=-1)
-        full_pred, _ = self.net2(net2_input)
-        return leaf_pred, full_pred
+        leaf_seq, _ = self.net1(x)
+        if self.training:
+            noise = torch.randn_like(leaf_seq) * 0.04
+            leaf_seq_noisy = leaf_seq + noise
+        else:
+            leaf_seq_noisy = leaf_seq
+        net2_input = torch.cat((x, leaf_seq_noisy), dim=-1)
+        full_seq, _ = self.net2(net2_input)
+        return leaf_seq, full_seq

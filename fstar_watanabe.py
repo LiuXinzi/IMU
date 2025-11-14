@@ -92,7 +92,8 @@ class STAR:
         self.J = model.J
         self.v_posed = model.v_posed
         self.v_shaped = model.v_shaped
-        self.J_transformed = model.J_transformed
+        self.J_transformed = model.J_transformed+self.trans
+        # print(self.J_transformed[0,:])
         self.model = model
 
 def verts_decorated_quat(trans, pose, v_template, J_regressor, weights, kintree_table, f,

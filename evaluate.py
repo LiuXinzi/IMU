@@ -113,14 +113,25 @@ def create_comparison_animation(preds: np.ndarray, targets: np.ndarray, edges: l
 
 
 def evaluate_sequence(model: PoseLSTM, inputs: torch.Tensor, joints_gt: torch.Tensor,
-                      joints_mean: np.ndarray, joints_std: np.ndarray, device: torch.device) -> dict:
+                      joints_mean: np.ndarray, joints_std: np.ndarray,
+                      center_index: int, device: torch.device,
+                      chunk_size: int = 512) -> dict:
+    """
+    分段送入模型以避免长序列一次性占用过多显存。
+    """
     model.eval()
+    preds_chunks = []
+    total = inputs.shape[0]
+
     with torch.no_grad():
-        inputs = inputs.to(device)
-        # import ipdb;ipdb.set_trace()
-        _, joints_pred = model(inputs)
-    preds = joints_pred.cpu().numpy()
-    targets = joints_gt.numpy()
+        for start in range(0, total, chunk_size):
+            end = min(start + chunk_size, total)
+            batch_inputs = inputs[start:end].to(device, non_blocking=True)
+            _, joints_seq = model(batch_inputs)
+            preds_chunks.append(joints_seq[:, center_index].cpu())
+
+    preds = torch.cat(preds_chunks, dim=0).numpy()
+    targets = joints_gt.cpu().numpy()
 
     preds_denorm = denormalize(preds, joints_mean, joints_std)
     targets_denorm = denormalize(targets, joints_mean, joints_std)
@@ -179,7 +190,7 @@ def aggregate_metrics(sequence_metrics: list) -> dict:
 def main():
 
 
-    summary_path = Path("models_KIT/training_summary.json").resolve()
+    summary_path = Path("models_CMU/training_summary.json").resolve()
     if not summary_path.exists():
         raise FileNotFoundError(f"Summary file not found: {summary_path}")
 
@@ -190,7 +201,8 @@ def main():
     model_key = "best_model_path"
     model_path = resolve_path(base_dir, summary[model_key])
     norm_params_path = resolve_path(base_dir, summary["norm_params_path"])
-    test_data_path = resolve_path(base_dir, summary["test_data_path"])
+    test_data_path = resolve_path(base_dir, summary["train_data_path"])
+    center_index = int(summary.get("hyperparameters", {}).get("center_index", 20))
 
     if not model_path.exists():
         raise FileNotFoundError(f"Model file not found: {model_path}")
@@ -207,6 +219,7 @@ def main():
     sequences = test_pack.get("sequences", [])
     if not sequences:
         raise RuntimeError("No test sequences available for evaluation.")
+    center_index = int(test_pack.get("center_index", center_index))
     # import ipdb;ipdb.set_trace()
     sample_inputs = sequences[0]["inputs"]
     sample_leaf = sequences[0]["leaf"]
@@ -232,14 +245,19 @@ def main():
     for seq in sequences:
         inputs = seq["inputs"].float()
         joints = seq["joints"].float()
+        centers = seq.get("centers")
+        centers_np = centers.cpu().numpy() if isinstance(centers, torch.Tensor) else None
 
-        metrics = evaluate_sequence(model, inputs, joints, joints_mean, joints_std, device)
+        metrics = evaluate_sequence(model, inputs, joints, joints_mean, joints_std, center_index, device)
+        metrics["centers"] = centers_np
+
         results.append({
             "file": seq["file"],
             "num_frames": metrics["num_frames"],
             "per_joint_mean": metrics["per_joint_mean"].tolist(),
             "per_joint_max": metrics["per_joint_max"].tolist(),
             "overall_mean": float(metrics["overall_mean"]),
+            "centers": centers_np.tolist() if centers_np is not None else None,
         })
         sequence_metrics.append(metrics)
 
@@ -266,22 +284,49 @@ def main():
     }
 
     if sequence_metrics:
-        worst_idx = int(np.argmin([item["overall_mean"] for item in results]))
-        worst_metrics = sequence_metrics[worst_idx]
-        preds = worst_metrics.pop("preds")
-        targets = worst_metrics.pop("targets")
-        edges = get_smpl_edges()
-
         vis_dir = base_dir / "evaluation"
         vis_dir.mkdir(parents=True, exist_ok=True)
-        stem = Path(results[worst_idx]["file"]).stem
-        video_path = vis_dir / f"{stem}_comparison.gif"
-        create_comparison_animation(preds, targets, edges, video_path)
-        output_payload["visualization"] = {
-            "sequence_file": results[worst_idx]["file"],
-            "video_path": str(video_path),
-        }
-        print(f"Saved comparison animation to: {video_path}")
+        edges = get_smpl_edges()
+        overall_means = np.array([metrics["overall_mean"] for metrics in sequence_metrics])
+        sorted_indices = np.argsort(overall_means)
+        select_k = min(5, len(sorted_indices))
+        visualization_payload = {"lowest": [], "highest": []}
+
+        for rank, idx in enumerate(sorted_indices[:select_k], 1):
+            metrics = sequence_metrics[idx]
+            preds = metrics["preds"]
+            targets = metrics["targets"]
+            centers = metrics.get("centers")
+            stem = Path(results[idx]["file"]).stem
+            gif_path = vis_dir / f"{stem}_rank{rank}_lowest.gif"
+            create_comparison_animation(preds, targets, edges, gif_path)
+            visualization_payload["lowest"].append({
+                "sequence_file": results[idx]["file"],
+                "overall_mean": float(results[idx]["overall_mean"]),
+                "gif_path": str(gif_path),
+                "rank": rank,
+                "centers": centers.tolist() if centers is not None else None,
+            })
+            print(f"Saved lowest error #{rank} animation to: {gif_path}")
+
+        for rank, idx in enumerate(sorted_indices[::-1][:select_k], 1):
+            metrics = sequence_metrics[idx]
+            preds = metrics["preds"]
+            targets = metrics["targets"]
+            centers = metrics.get("centers")
+            stem = Path(results[idx]["file"]).stem
+            gif_path = vis_dir / f"{stem}_rank{rank}_highest.gif"
+            create_comparison_animation(preds, targets, edges, gif_path)
+            visualization_payload["highest"].append({
+                "sequence_file": results[idx]["file"],
+                "overall_mean": float(results[idx]["overall_mean"]),
+                "gif_path": str(gif_path),
+                "rank": rank,
+                "centers": centers.tolist() if centers is not None else None,
+            })
+            print(f"Saved highest error #{rank} animation to: {gif_path}")
+
+        output_payload["visualizations"] = visualization_payload
 
     # if args.output:
     #     output_path = Path(args.output).resolve()
