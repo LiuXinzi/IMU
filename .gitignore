@@ -20,7 +20,7 @@ processed/
 processed_CMU/
 processed_KIT/
 processed_try/
-
+star/
 wandb/
 
 __pycache__/
