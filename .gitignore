@@ -7,4 +7,20 @@ wandb/
 processed_KIT/
 processed_CMU/
 a/
+models/
+models_CMU/
+models_KIT/
+*.gif
+*.pth
+*.pt
+*.npz
+*.npy
 
+processed/
+processed_CMU/
+processed_KIT/
+processed_try/
+
+wandb/
+
+__pycache__/
