@@ -13,7 +13,7 @@ from model_def import PoseLSTM
 from torch.nn.utils.rnn import pad_sequence
 
 
-# ------------------- 超参数 ------------------- #
+# ------------------- hyper parameters ------------------- #
 TRAIN_RATIO = 0.8
 VAL_RATIO = 0.15
 NUM_PAST_FRAME = 30
@@ -25,11 +25,11 @@ STEP_SIZE_EVAL = 1
 BATCH_SIZE = 4
 EPOCHS = 100
 LEARNING_RATE = 1e-4
-L2_LAMBDA = 1e-4
+L2_LAMBDA = 7e-5
 RANDOM_SEED = 42
 
 
-# ------------------- WandB 初始化 ------------------- #
+# ------------------- WandB Initialize ------------------- #
 wandb.init(
     project="Pose_LSTM",
     name="PoseLSTM_two_stage",
@@ -213,14 +213,14 @@ def main():
     val_files = files[n_train:n_train + n_val]
     test_files = files[n_train + n_val:]
 
-    # 确保至少有一个测试文件
+    # At least one test file
     if not test_files:
         test_files = val_files[-1:]
         val_files = val_files[:-1]
 
-    print(f"train文件数: {len(train_files)}")
-    print(f"val文件数: {len(val_files)}")
-    print(f"test文件数: {len(test_files)}")
+    print(f"train_file: {len(train_files)}")
+    print(f"val_file: {len(val_files)}")
+    print(f"test_file: {len(test_files)}")
 
     acc_tr, quat_tr, joints_tr, leaf_tr = load_split(train_files)
     acc_val, quat_val, joints_val, leaf_val = load_split(val_files)
@@ -318,7 +318,7 @@ def main():
         full_output_size=joint_size,
     ).to(device)
 
-    criterion = nn.MSELoss(reduction="mean")
+    criterion = nn.MSELoss(reduction="none")
     optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=L2_LAMBDA)
 
     best_val = None
@@ -343,10 +343,16 @@ def main():
             full_pred = full_seq[:, CENTER_INDEX]
             # print("leaf_seq:", leaf_seq.shape)
             # print("leaf_batch:", leaf_batch.shape)
-            leaf_loss = criterion(leaf_seq, leaf_batch)
-            full_loss = criterion(full_seq, joint_batch)
+            mse_leaf = criterion(leaf_seq, leaf_batch)
+            mse_full = criterion(full_seq, joint_batch)
+            mask_leaf = (leaf_batch != 0).float()
+            leaf_loss = (mse_leaf * mask_leaf).sum() / mask_leaf.sum()
+            mask_full = (joint_batch != 0).float()
+            full_loss = (mse_full * mask_full).sum() / mask_full.sum()
+
             loss = leaf_loss + full_loss
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
 
             train_leaf_loss += leaf_loss.item()
@@ -374,8 +380,12 @@ def main():
                     leaf_seq, full_seq = model(X_batch)
                     # leaf_pred = leaf_seq[:, CENTER_INDEX]
                     # full_pred = full_seq[:, CENTER_INDEX]
-                    leaf_loss = criterion(leaf_seq, leaf_batch)
-                    full_loss = criterion(full_seq, joint_batch)
+                    mse_leaf = criterion(leaf_seq, leaf_batch)
+                    mse_full = criterion(full_seq, joint_batch)
+                    mask_leaf = (leaf_batch != 0).float()
+                    leaf_loss = (mse_leaf * mask_leaf).sum() / mask_leaf.sum()
+                    mask_full = (joint_batch != 0).float()
+                    full_loss = (mse_full * mask_full).sum() / mask_full.sum()
                     val_leaf_loss += leaf_loss.item()
                     val_full_loss += full_loss.item()
                     val_samples += leaf_batch.size(0)
