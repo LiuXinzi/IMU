@@ -11,6 +11,13 @@ class RNN(nn.Module):
     def __init__(self, n_input, n_output, n_hidden,
                  n_rnn_layer=2, bidirectional=True, dropout=0.2):
         super().__init__()
+        self.num_directions = 2 if bidirectional else 1
+        # self.h0 = nn.Parameter(
+        # torch.zeros(self.n_rnn_layer * self.num_directions, n_hidden)
+        # )
+        # self.c0 = nn.Parameter(
+        # torch.zeros(self.n_rnn_layer * self.num_directions, n_hidden)
+        # )
         self.input_proj = nn.Linear(n_input, n_hidden)
         self.dropout = nn.Dropout(dropout)
         self.rnn = nn.LSTM(
@@ -29,11 +36,27 @@ class RNN(nn.Module):
         Returns:
             output: Tensor of shape (batch, seq_len, n_output).
         """
+
+        # batch = x.size(0)
+
+        # if h is None:
+        #    h0 = self.h0.unsqueeze(1).expand(-1, batch, -1).contiguous()
+        #    c0 = self.c0.unsqueeze(1).expand(-1, batch, -1).contiguous()
+        #    h = (h0, c0)
+
+        # ------------------------------
+        # Input projection + activation
+        # ------------------------------
         y = torch.relu(self.input_proj(self.dropout(x)))
-        # y = self.dropout(y)
+
+       
         y, h = self.rnn(y, h)
-        # y = self.dropout(y)
+
+       # ------------------------------
+       # Output projection
+       # ------------------------------
         output = self.output_proj(y)
+
         return output, h
 
 

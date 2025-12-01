@@ -22,7 +22,7 @@ def timeit(func):
         return val
     return wrapper
 
-# 用于存储计算结果及附加属性，便于后续用 np.array(model) 获取数值数据
+# SAR model class
 class ModelResult:
     def __init__(self, data):
         self.data = data
@@ -30,7 +30,7 @@ class ModelResult:
         return np.array(self.data, dtype=dtype)
 
 class STAR:
-    def __init__(self, gender='male', num_betas=10):
+    def __init__(self, gender='male', num_betas=10, skip_forward = False):
         if gender not in ['male', 'female', 'neutral']:
             raise RuntimeError('Invalid model gender!')
         if num_betas < 2:
@@ -58,7 +58,10 @@ class STAR:
         self.num_joints = self.weights.shape[1]
         self.num_betas = num_betas
         
-        self.forward()
+        # self.forward()
+        if not skip_forward:
+           self.forward()
+
     
     
     # @timeit
@@ -92,30 +95,30 @@ class STAR:
         self.J = model.J
         self.v_posed = model.v_posed
         self.v_shaped = model.v_shaped
-        self.J_transformed = model.J_transformed+self.trans
+        self.J_transform , ed = model.J_transformed+self.trans
         # print(self.J_transformed[0,:])
         self.model = model
 
 def verts_decorated_quat(trans, pose, v_template, J_regressor, weights, kintree_table, f,
                            posedirs=None, betas=None, add_shape=True, shapedirs=None, want_Jtr=False):
-    # 计算形状变化
+     # Calculate shape deformation
     v_shaped = v_template + shapedirs @ betas # (V, 3)
     
-    # 计算姿态相关的 blendshape
-    quaternion_angles = axis2quat( pose.reshape((-1, 3))[1:] ).reshape(-1)  # 去掉root rot
-    shape_feat = np.array([betas[1]])    # STAR 使用第2个 beta 值作为姿态补偿
+    # Calculate pose-dependent blend shapes
+    quaternion_angles = axis2quat( pose.reshape((-1, 3))[1:] ).reshape(-1)  # Remove root rotation
+    shape_feat = np.array([betas[1]])    # STAR uses the 2nd beta value for pose compensation
     feat = np.concatenate([quaternion_angles, shape_feat], axis=0)
     poseblends = posedirs @ feat
     v_posed = v_shaped + poseblends
 
-    # 计算关节位置（使用加权求和）
+    # Calculate joint positions (using weighted sum)
     J = J_regressor @ v_shaped
 
     result, meta = verts_core(pose, v_posed, J, weights, kintree_table, want_Jtr=True)
     tr = trans.reshape((1, 3))
     result = result + tr
 
-    # 将结果封装到 ModelResult 对象中，便于附加额外属性
+    # Wrap results in ModelResult object for attaching additional attributes
     model_result = ModelResult(result)
     model_result.trans = trans
     model_result.f = f
@@ -134,7 +137,7 @@ def verts_decorated_quat(trans, pose, v_template, J_regressor, weights, kintree_
 
 def verts_core(pose, v, J, weights, kintree_table, want_Jtr=False):
     A, A_global = global_rigid_transformation(pose, J, kintree_table)
-    # 计算 T = A.dot(weights.T)
+    # Calculate T = A.dot(weights.T)
     T = np.tensordot(A, weights.T, axes=([2], [0]))  # (4, 4, v)
     
     rest_shape_h = np.vstack((v.T, np.ones((1, v.shape[0]))))  # (4, v)
@@ -168,7 +171,7 @@ def global_rigid_transformation(pose, J, kintree_table):
     results_global = np.zeros((num_joints,4,4))
     results_global[:,3,3] = 1
     
-    # 第一个关节
+    # First joint
     R0 = rodrigues(pose[0, :])
     results_global[0,:3,:3] = R0
     results_global[0,:3, 3] = J[0, :]
@@ -215,25 +218,25 @@ def rodrigues(r):
     theta = np.sqrt(r[0]*r[0] + r[1]*r[1] + r[2]*r[2])
     R = np.empty((3, 3))
     if theta < 1e-8:
-        # 返回单位矩阵
+        # Return identity matrix
         for i in range(3):
             for j in range(3):
                 R[i, j] = 0.0
             R[i, i] = 1.0
         return R
     k = r / theta
-    # 构造反对称矩阵 K
+    # Construct skew-symmetric matrix K
     K = np.empty((3, 3))
     K[0, 0] = 0.0;    K[0, 1] = -k[2];  K[0, 2] = k[1]
     K[1, 0] = k[2];   K[1, 1] = 0.0;    K[1, 2] = -k[0]
     K[2, 0] = -k[1];  K[2, 1] = k[0];   K[2, 2] = 0.0
-    # 构造单位矩阵 I
+    # Construct identity matrix I
     I = np.empty((3, 3))
     for i in range(3):
         for j in range(3):
             I[i, j] = 0.0
         I[i, i] = 1.0
-    # 计算 K^2 = K @ K
+    # Compute K^2 = K @ K
     K2 = np.empty((3, 3))
     for i in range(3):
         for j in range(3):

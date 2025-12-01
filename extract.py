@@ -42,10 +42,15 @@ def compute_mean_position(A, B, C):
 def normalize(v):
     return v / np.linalg.norm(v)
 
+# def compute_orientation(x, y, z):
+#     rot_matrix = np.vstack([normalize(x), normalize(y), normalize(z)]).T
+#     rotation = R.from_matrix(rot_matrix)
+#     return rotation.as_quat()
+
 def compute_orientation(x, y, z):
     rot_matrix = np.vstack([normalize(x), normalize(y), normalize(z)]).T
-    rotation = R.from_matrix(rot_matrix)
-    return rotation.as_quat()
+    return rot_matrix.astype(np.float32)   
+
 
 def synthesize_acceleration(pos, fps, smooth_n=4):
     """
@@ -61,47 +66,100 @@ def synthesize_acceleration(pos, fps, smooth_n=4):
         acc[smooth_n:-smooth_n] = refined
     return acc
 
-def to_pelvis_frame(pos_arr, quat_arr, joint_arr, leaf_arr, pelvis_idx, root_joint_idx=0):
-    """
-    Convert IMU signals and joint positions into the pelvis local frame.
-    """
-    pelvis_pos =joint_arr[:, root_joint_idx]
-    pelvis_quat = quat_arr[:, pelvis_idx]
+# def to_pelvis_frame(pos_arr, quat_arr, joint_arr, leaf_arr, pelvis_idx, root_joint_idx=0):
+#     """
+#     Convert IMU signals and joint positions into the pelvis local frame.
+#     """
+#     pelvis_pos =joint_arr[:, root_joint_idx]
+#     pelvis_quat = quat_arr[:, pelvis_idx]
 
-    rel_pos = np.empty_like(pos_arr)
-    rel_quat = np.empty_like(quat_arr)
-    rel_joint = np.empty_like(joint_arr)
-    rel_leaf = np.empty_like(leaf_arr)
+#     rel_pos = np.empty_like(pos_arr)
+#     rel_quat = np.empty_like(quat_arr)
+#     rel_joint = np.empty_like(joint_arr)
+#     rel_leaf = np.empty_like(leaf_arr)
 
-    pelvis_rot_inv = R.from_quat(pelvis_quat).inv()
+#     pelvis_rot_inv = R.from_quat(pelvis_quat).inv()
 
-    for f in range(quat_arr.shape[0]):
-        inv_rot = pelvis_rot_inv[f]
-        rel_pos[f] = inv_rot.apply(pos_arr[f] - pelvis_pos[f])
-        root_pos = joint_arr[f, root_joint_idx]
-        rel_joint[f] = inv_rot.apply(joint_arr[f] - root_pos)
-        rel_leaf[f] = inv_rot.apply(leaf_arr[f] - root_pos)
-        sensor_rot = R.from_quat(quat_arr[f])
-        rel_quat[f] = (inv_rot * sensor_rot).as_quat()
+#     for f in range(quat_arr.shape[0]):
+#         inv_rot = pelvis_rot_inv[f]
+#         rel_pos[f] = inv_rot.apply(pos_arr[f] - pelvis_pos[f])
+#         root_pos = joint_arr[f, root_joint_idx]
+#         rel_joint[f] = inv_rot.apply(joint_arr[f] - root_pos)
+#         rel_leaf[f] = inv_rot.apply(leaf_arr[f] - root_pos)
+#         sensor_rot = R.from_quat(quat_arr[f])
+#         rel_quat[f] = (inv_rot * sensor_rot).as_quat()
 
-    return rel_pos, rel_quat, rel_joint, rel_leaf
+#     return rel_pos, rel_quat, rel_joint, rel_leaf
+
+# def simulate_IMU(skin_verts, idx1, idx2, idx3):
+#     A, B, C = get_points_by_indices(skin_verts, idx1, idx2, idx3)
+#     mean_position = compute_mean_position(A, B, C)
+#     normal = compute_normal(A, B, C)
+#     x_axis = normalize(vector(A, B))
+#     z_axis = normalize(normal)
+#     y_axis = np.cross(z_axis, x_axis)
+#     orientation_quat = compute_orientation(x_axis, y_axis, z_axis)
+#     return mean_position, orientation_quat
 
 def simulate_IMU(skin_verts, idx1, idx2, idx3):
     A, B, C = get_points_by_indices(skin_verts, idx1, idx2, idx3)
+    
     mean_position = compute_mean_position(A, B, C)
+
     normal = compute_normal(A, B, C)
     x_axis = normalize(vector(A, B))
     z_axis = normalize(normal)
     y_axis = np.cross(z_axis, x_axis)
-    orientation_quat = compute_orientation(x_axis, y_axis, z_axis)
-    return mean_position, orientation_quat
+
+    # MUST return 3x3 matrix
+    orientation_mat = compute_orientation(x_axis, y_axis, z_axis)
+
+    # validate
+    orientation_mat = orientation_mat.reshape(3, 3)  # ensure correct shape
+    return mean_position, orientation_mat
+
+
+
+def to_pelvis_frame(pos_arr, rot_arr, joint_arr, leaf_arr, pelvis_idx, root_joint_idx=0):
+
+    F = pos_arr.shape[0]
+    N = pos_arr.shape[1]   # number of IMUs (6)
+
+    pelvis_pos = joint_arr[:, root_joint_idx]     # (F,3)
+    pelvis_rot = rot_arr[:, pelvis_idx]           # (F,3,3)
+
+    rel_pos = np.empty_like(pos_arr)              # (F,6,3)
+    rel_rot = np.empty_like(rot_arr)              # (F,6,3,3)
+    rel_joint = np.empty_like(joint_arr)          # (F,J,3)
+    rel_leaf = np.empty_like(leaf_arr)            # (F,6,3)
+
+    pelvis_rot_inv = pelvis_rot.transpose(0,2,1)  # (F,3,3)
+
+    for f in range(F):
+        inv_R = pelvis_rot_inv[f]
+
+        # ---- IMU pos: each of 6 sensors individually ----
+        for i in range(N):
+            rel_pos[f, i] = inv_R @ (pos_arr[f, i] - pelvis_pos[f])
+            rel_rot[f, i] = inv_R @ rot_arr[f, i]
+
+        # ---- joints ----
+        root_pos = joint_arr[f, root_joint_idx]
+        rel_joint[f] = (inv_R @ (joint_arr[f] - root_pos).T).T
+
+        # ---- leaf joints ----
+        rel_leaf[f] = (inv_R @ (leaf_arr[f] - root_pos).T).T
+
+    return rel_pos, rel_rot, rel_joint, rel_leaf
+
+
 
 # ------------------- 目录设置 ------------------- #
 def process_dataset(target_dir=None, output_dir=None):
     if target_dir is None:
         target_dir = os.path.join(os.path.dirname(__file__), "CMU")
     if output_dir is None:
-        output_dir = os.path.join(os.path.dirname(__file__), "processed_CMU")
+        output_dir = os.path.join(os.path.dirname(__file__), "processed_CMU_1")
 
     os.makedirs(output_dir, exist_ok=True)
 

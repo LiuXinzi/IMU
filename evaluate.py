@@ -9,10 +9,11 @@ from matplotlib import animation
 
 from model_def import PoseLSTM
 
-try:
-    from fstar_watanabe import STAR  # Optional, used for edge extraction
-except ImportError:  # pragma: no cover - fallback when STAR is unavailable
-    STAR = None
+# try:
+#     from fstar_watanabe import STAR  # Optional, used for edge extraction
+# except ImportError:  # pragma: no cover - fallback when STAR is unavailable
+#     STAR = None
+from fstar_watanabe import STAR
 
 
 def resolve_path(base_dir: Path, path_str: str) -> Path:
@@ -28,23 +29,30 @@ def denormalize(flat_array: np.ndarray, mean: np.ndarray, std: np.ndarray) -> np
     return flat_array * std_flat + mean_flat
 
 
-def get_smpl_edges() -> list:
-    if STAR is not None:
-        try:
-            star = STAR(gender="neutral", num_betas=10)
-            kintree = star.kintree_table
-            return [(int(kintree[0, i]), int(kintree[1, i])) for i in range(1, kintree.shape[1])]
-        except Exception:
-            pass
+# def get_smpl_edges() -> list:
+#     if STAR is not None:
+#         try:
+#             star = STAR(gender="neutral", num_betas=10)
+#             kintree = star.kintree_table
+#             return [(int(kintree[0, i]), int(kintree[1, i])) for i in range(1, kintree.shape[1])]
+#         except Exception:
+#             pass
 
-    return [
-        (0, 1), (1, 2), (2, 3),
-        (0, 4), (4, 5), (5, 6),
-        (0, 7), (7, 8), (8, 9), (9, 10), (10, 11),
-        (8, 12), (12, 13), (13, 14), (14, 15),
-        (8, 16), (16, 17), (17, 18), (18, 19),
-        (9, 20), (20, 21), (14, 22), (22, 23),
-    ]
+#     return [
+#         (0, 1), (1, 2), (2, 3),
+#         (0, 4), (4, 5), (5, 6),
+#         (0, 7), (7, 8), (8, 9), (9, 10), (10, 11),
+#         (8, 12), (12, 13), (13, 14), (14, 15),
+#         (8, 16), (16, 17), (17, 18), (18, 19),
+#         (9, 20), (20, 21), (14, 22), (22, 23),
+#     ]
+
+def get_smpl_edges() -> list:
+    
+    star = STAR(gender="neutral", num_betas=10, skip_forward=True)
+    kintree = star.kintree_table
+    return [(int(kintree[0, i]), int(kintree[1, i])) for i in range(1, kintree.shape[1])]
+        
 
 
 def set_axes_equal(ax, coords: np.ndarray):
@@ -85,6 +93,8 @@ def create_comparison_animation(preds: np.ndarray, targets: np.ndarray, edges: l
     def update(frame_idx):
         gt = targets[frame_idx]
         pred = preds[frame_idx]
+        # print(f"target{gt[0]}")
+        # print(f"pred{pred[0]}")
 
         scatter_gt._offsets3d = (gt[:, 0], gt[:, 1], gt[:, 2])
         scatter_pred._offsets3d = (pred[:, 0], pred[:, 1], pred[:, 2])
@@ -117,7 +127,7 @@ def evaluate_sequence(model: PoseLSTM, inputs: torch.Tensor, joints_gt: torch.Te
                       center_index: int, device: torch.device,
                       chunk_size: int = 512) -> dict:
     """
-    分段送入模型以避免长序列一次性占用过多显存。
+    Evaluate a single sequence and compute error metrics.
     """
     model.eval()
     preds_chunks = []
@@ -133,14 +143,17 @@ def evaluate_sequence(model: PoseLSTM, inputs: torch.Tensor, joints_gt: torch.Te
     preds = torch.cat(preds_chunks, dim=0).numpy()
     targets = joints_gt.cpu().numpy()
 
-    preds_denorm = denormalize(preds, joints_mean, joints_std)
-    targets_denorm = denormalize(targets, joints_mean, joints_std)
+    # preds_denorm = denormalize(preds, joints_mean, joints_std)
+    # targets_denorm = denormalize(targets, joints_mean, joints_std)
 
     num_joints = joints_mean.reshape(-1, 3).shape[0]
-    preds_denorm = preds_denorm.reshape(preds_denorm.shape[0], num_joints, 3)
-    targets_denorm = targets_denorm.reshape(targets_denorm.shape[0], num_joints, 3)
+    # preds_denorm = preds_denorm.reshape(preds_denorm.shape[0], num_joints, 3)
+    # targets_denorm = targets_denorm.reshape(targets_denorm.shape[0], num_joints, 3)
 
-    errors = np.linalg.norm(preds_denorm - targets_denorm, axis=2)
+    preds = preds.reshape(preds.shape[0], num_joints, 3)
+    targets = targets.reshape(targets.shape[0], num_joints, 3)
+
+    errors = np.linalg.norm(preds - targets, axis=2)
 
     per_joint_mean = errors.mean(axis=0)
     per_joint_max = errors.max(axis=0)
@@ -152,8 +165,8 @@ def evaluate_sequence(model: PoseLSTM, inputs: torch.Tensor, joints_gt: torch.Te
         "per_joint_max": per_joint_max,
         "overall_mean": overall_mean,
         "errors": errors,
-        "preds": preds_denorm,
-        "targets": targets_denorm,
+        "preds": preds,
+        "targets": targets,
     }
 
 
@@ -198,9 +211,12 @@ def main():
         summary = json.load(f)
 
     base_dir = summary_path.parent
-    model_key = "best_model_path"
-    model_path = resolve_path(base_dir, summary[model_key])
-    norm_params_path = resolve_path(base_dir, summary["norm_params_path"])
+    # model_key = "best_model_path"
+    # model_path = resolve_path(base_dir, summary[model_key])
+    model_path = resolve_path(base_dir, "best_model_rotate.pth")
+    # norm_params_path = resolve_path(base_dir, summary["norm_params_path"])
+    norm_params_path = resolve_path(base_dir, "norm_params_selected.npz")
+    # test_data_path = resolve_path(base_dir, summary["train_data_path"])
     test_data_path = resolve_path(base_dir, summary["train_data_path"])
     center_index = int(summary.get("hyperparameters", {}).get("center_index", 20))
 
@@ -284,12 +300,13 @@ def main():
     }
 
     if sequence_metrics:
-        vis_dir = base_dir / "evaluation"
+        vis_dir = base_dir / "all_rot_selected_2"
         vis_dir.mkdir(parents=True, exist_ok=True)
         edges = get_smpl_edges()
         overall_means = np.array([metrics["overall_mean"] for metrics in sequence_metrics])
         sorted_indices = np.argsort(overall_means)
-        select_k = min(5, len(sorted_indices))
+        select_k = min(22, len(sorted_indices))
+        select_k1 = min(1, len(sorted_indices))
         visualization_payload = {"lowest": [], "highest": []}
 
         for rank, idx in enumerate(sorted_indices[:select_k], 1):
@@ -309,7 +326,7 @@ def main():
             })
             print(f"Saved lowest error #{rank} animation to: {gif_path}")
 
-        for rank, idx in enumerate(sorted_indices[::-1][:select_k], 1):
+        for rank, idx in enumerate(sorted_indices[::-1][:select_k1], 1):
             metrics = sequence_metrics[idx]
             preds = metrics["preds"]
             targets = metrics["targets"]
@@ -327,13 +344,46 @@ def main():
             print(f"Saved highest error #{rank} animation to: {gif_path}")
 
         output_payload["visualizations"] = visualization_payload
+        # print(preds.min(),preds.max())
+        # print(len(edges))
+        # print(edges[:5])
+
+#     # -----------------------------------------
+# # save top-100 highest error CMU IDs to txt
+# # -----------------------------------------
+
+# # extract file paths and their overall mean errors
+#     file_errors = [(item["file"], item["overall_mean"]) for item in results]
+
+# # sort errors from high to low
+#     file_errors_sorted = sorted(file_errors, key=lambda x: x[1], reverse=True)
+
+# # select top-100
+#     top_k = min(100, len(file_errors_sorted))
+#     top_100 = file_errors_sorted[:top_k]
+
+# # extract CMU IDs from file paths (e.g., 16_34)
+#     cmu_ids = [Path(f).stem for (f, _) in top_100]
+
+#     # save to txt file
+#     txt_path = base_dir / "evaluation" / "top100_highest_error_CMU_ids.txt"
+#     txt_path.parent.mkdir(parents=True, exist_ok=True)
+
+#     with open(txt_path, "w") as f:
+#         for cid in cmu_ids:
+#            f.write(f"{cid}\n")
+
+#     print(f"\nSaved top-100 highest error CMU IDs to: {txt_path}")
+
+
+
 
     # if args.output:
     #     output_path = Path(args.output).resolve()
     #     output_path.parent.mkdir(parents=True, exist_ok=True)
     #     with open(output_path, "w", encoding="utf-8") as f:
     #         json.dump(output_payload, f, indent=2)
-    #     print(f"Saved evaluation metrics to {output_path}")
+    #     print(f"Saved evaluation metrics to {output_path}")aaaaa
 
 
 if __name__ == "__main__":
