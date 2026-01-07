@@ -1,5 +1,5 @@
-import json
 import random
+import time
 from pathlib import Path
 from typing import List, Tuple
 
@@ -10,32 +10,56 @@ import torch.optim as optim
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader, Dataset
 
-from model_def import PoseLSTM
+from model_def import PoseLSTM, PoseTransformer, PoseTransformerCond
 
 # ------------------- 运行配置（直接修改下方变量） ------------------- #
 DATA_DIR = "data"        # 目录下所有 npz 即数据集
-OUTPUT_DIR = Path("models_seq")       # 模型与归一化统计保存目录
-EPOCHS = 80
-BATCH_SIZE = 10
+OUTPUT_DIR = Path("lstm")       # 模型与归一化统计保存目录
+MODEL_TYPE = "lstm"            # 可选: "lstm"、"transformer"、"transformer_cond"
+EPOCHS = 100
+BATCH_SIZE = 50
 LR = 2e-4
 WEIGHT_DECAY = 1e-4
 VAL_RATIO = 0.1
 SEED = 42
+# DataLoader 相关配置
+NUM_WORKERS = 0
+PIN_MEMORY = True
+PERSISTENT_WORKERS = True
+PREFETCH_FACTOR = 2
+# 分段训练长度
+SEGMENT_LEN = 100
+# 早停策略
+EARLY_STOP_PATIENCE = 10
+EARLY_STOP_MIN_DELTA = 0.0
+# Transformer 相关超参（仅在 MODEL_TYPE="transformer" 时使用）
+TF_D_MODEL = 256
+TF_NHEAD = 8
+TF_LAYERS = 4
+TF_FF = 512
+TF_DROPOUT = 0.1
 
 
 # ------------------- 数据集 ------------------- #
 class SequenceDataset(Dataset):
-    """持有完整序列 (x, y) 的数据集，x: (T,72)，y: (T,72)。"""
+    """按需从 npz 路径加载完整序列 (x, y)。"""
 
-    def __init__(self, sequences: List[Tuple[np.ndarray, np.ndarray]]):
-        self.sequences = sequences
+    def __init__(self, paths: List[Path]):
+        self.paths = paths
 
     def __len__(self) -> int:
-        return len(self.sequences)
+        return len(self.paths)
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        x, y = self.sequences[idx]
-        return torch.from_numpy(x).float(), torch.from_numpy(y).float()
+        path = self.paths[idx]
+        data = np.load(path, mmap_mode="r")
+        x = data["x"]
+        y = data["y"]
+        if x.dtype != np.float32:
+            x = x.astype(np.float32)
+        if y.dtype != np.float32:
+            y = y.astype(np.float32)
+        return torch.from_numpy(x), torch.from_numpy(y)
 
 
 def collate_fn(batch):
@@ -89,17 +113,6 @@ def set_seed(seed: int):
         torch.cuda.manual_seed_all(seed)
 
 
-def load_sequences(paths: List[Path]) -> List[Tuple[np.ndarray, np.ndarray]]:
-    sequences = []
-    for p in paths:
-        data = np.load(p)
-        x = data["x"].astype(np.float32)  # (T, 72)
-        y = data["y"].astype(np.float32)  # (T, 72)  (24*3)
-
-        sequences.append((x, y))
-    return sequences
-
-
 # ------------------- 训练主流程 ------------------- #
 def train(
     data_dir: Path,
@@ -118,45 +131,79 @@ def train(
     if not all_paths:
         raise RuntimeError(f"目录中未找到 npz 数据: {data_dir}")
 
-    sequences = load_sequences(all_paths)
-
     # 划分训练/验证
     rng = np.random.default_rng(seed)
-    indices = np.arange(len(sequences))
+    indices = np.arange(len(all_paths))
     rng.shuffle(indices)
     split = max(1, int(len(indices) * (1 - val_ratio)))
     train_idx = indices[:split]
     val_idx = indices[split:] if split < len(indices) else indices[-1:]
 
-    train_seqs = [sequences[i] for i in train_idx]
-    val_seqs = [sequences[i] for i in val_idx]
+    train_paths = [all_paths[i] for i in train_idx]
+    val_paths = [all_paths[i] for i in val_idx]
 
     train_loader = DataLoader(
-        SequenceDataset(train_seqs),
+        SequenceDataset(train_paths),
         batch_size=batch_size,
         shuffle=True,
         collate_fn=collate_fn,
+        num_workers=NUM_WORKERS,
+        pin_memory=PIN_MEMORY,
+        persistent_workers=PERSISTENT_WORKERS if NUM_WORKERS > 0 else False,
+        prefetch_factor=PREFETCH_FACTOR if NUM_WORKERS > 0 else None,
     )
     val_loader = DataLoader(
-        SequenceDataset(val_seqs),
+        SequenceDataset(val_paths),
         batch_size=batch_size,
         shuffle=False,
         collate_fn=collate_fn,
+        num_workers=NUM_WORKERS,
+        pin_memory=PIN_MEMORY,
+        persistent_workers=PERSISTENT_WORKERS if NUM_WORKERS > 0 else False,
+        prefetch_factor=PREFETCH_FACTOR if NUM_WORKERS > 0 else None,
     )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = PoseLSTM(
-        input_size=72,
-        leaf_output_size=len(LEAF_IDS) * 3,
-        full_output_size=24 * 3,
-    ).to(device)
+    if MODEL_TYPE == "lstm":
+        model = PoseLSTM(
+            input_size=72,
+            leaf_output_size=len(LEAF_IDS) * 3,
+            full_output_size=24 * 3,
+        ).to(device)
+    elif MODEL_TYPE == "transformer":
+        model = PoseTransformer(
+            input_size=72,
+            full_output_size=24 * 3,
+            d_model=TF_D_MODEL,
+            nhead=TF_NHEAD,
+            num_layers=TF_LAYERS,
+            dim_feedforward=TF_FF,
+            dropout=TF_DROPOUT,
+        ).to(device)
+    elif MODEL_TYPE == "transformer_cond":
+        model = PoseTransformerCond(
+            input_size=72,
+            leaf_output_size=len(LEAF_IDS) * 3,
+            full_output_size=24 * 3,
+            d_model=TF_D_MODEL,
+            nhead=TF_NHEAD,
+            num_layers=TF_LAYERS,
+            dim_feedforward=TF_FF,
+            dropout=TF_DROPOUT,
+        ).to(device)
+    else:
+        raise ValueError(f"Unsupported MODEL_TYPE: {MODEL_TYPE}")
 
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     best_val = None
+    best_epoch = None
+    no_improve = 0
     best_path = output_dir / "best_model.pth"
     last_path = output_dir / "last_model.pth"
 
+    total_start = time.perf_counter()
     for epoch in range(1, epochs + 1):
+        epoch_start = time.perf_counter()
         model.train()
         train_leaf_loss = 0.0
         train_full_loss = 0.0
@@ -167,19 +214,53 @@ def train(
             y_batch = y_batch.to(device)
             mask = (torch.arange(x_batch.shape[1], device=device)[None, :] < lengths.to(device)[:, None]).float()
 
-            optimizer.zero_grad()
-            leaf_pred, full_pred = model(x_batch)
-            leaf_gt, full_gt = split_leaf_full(y_batch)
+            segment_indices = []
+            max_len = x_batch.shape[1]
+            for start in range(0, max_len, SEGMENT_LEN):
+                end = min(start + SEGMENT_LEN, max_len)
+                mask_seg = mask[:, start:end]
+                if mask_seg.sum().item() == 0:
+                    continue
+                segment_indices.append((start, end))
 
-            leaf_loss = masked_mse(leaf_pred, leaf_gt, mask)
-            full_loss = masked_mse(full_pred, full_gt, mask)
-            loss = leaf_loss + full_loss
-            loss.backward()
+            if not segment_indices:
+                continue
+
+            optimizer.zero_grad()
+            batch_leaf = 0.0
+            batch_full = 0.0
+            for start, end in segment_indices:
+                x_seg = x_batch[:, start:end]
+                y_seg = y_batch[:, start:end]
+                mask_seg = mask[:, start:end]
+                key_padding_mask = (mask_seg == 0).bool()
+
+                if MODEL_TYPE == "lstm":
+                    leaf_pred, full_pred = model(x_seg)
+                    leaf_gt, full_gt = split_leaf_full(y_seg)
+                    leaf_loss = masked_mse(leaf_pred, leaf_gt, mask_seg)
+                    full_loss = masked_mse(full_pred, full_gt, mask_seg)
+                elif MODEL_TYPE == "transformer":
+                    full_pred = model(x_seg, key_padding_mask=key_padding_mask)
+                    _, full_gt = split_leaf_full(y_seg)
+                    leaf_loss = torch.tensor(0.0, device=device)
+                    full_loss = masked_mse(full_pred, full_gt, mask_seg)
+                else:  # transformer_cond
+                    leaf_pred, full_pred = model(x_seg, key_padding_mask=key_padding_mask)
+                    leaf_gt, full_gt = split_leaf_full(y_seg)
+                    leaf_loss = masked_mse(leaf_pred, leaf_gt, mask_seg)
+                    full_loss = masked_mse(full_pred, full_gt, mask_seg)
+
+                loss = (leaf_loss + full_loss) / len(segment_indices)
+                loss.backward()
+                batch_leaf += leaf_loss.item()
+                batch_full += full_loss.item()
+
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
 
-            train_leaf_loss += leaf_loss.item()
-            train_full_loss += full_loss.item()
+            train_leaf_loss += batch_leaf / len(segment_indices)
+            train_full_loss += batch_full / len(segment_indices)
             batches += 1
 
         train_leaf_loss /= max(1, batches)
@@ -197,34 +278,78 @@ def train(
                 y_batch = y_batch.to(device)
                 mask = (torch.arange(x_batch.shape[1], device=device)[None, :] < lengths.to(device)[:, None]).float()
 
-                leaf_pred, full_pred = model(x_batch)
-                leaf_gt, full_gt = split_leaf_full(y_batch)
+                segment_indices = []
+                max_len = x_batch.shape[1]
+                for start in range(0, max_len, SEGMENT_LEN):
+                    end = min(start + SEGMENT_LEN, max_len)
+                    mask_seg = mask[:, start:end]
+                    if mask_seg.sum().item() == 0:
+                        continue
+                    segment_indices.append((start, end))
 
-                leaf_loss = masked_mse(leaf_pred, leaf_gt, mask)
-                full_loss = masked_mse(full_pred, full_gt, mask)
+                if not segment_indices:
+                    continue
 
-                val_leaf_loss += leaf_loss.item()
-                val_full_loss += full_loss.item()
+                batch_leaf = 0.0
+                batch_full = 0.0
+                for start, end in segment_indices:
+                    x_seg = x_batch[:, start:end]
+                    y_seg = y_batch[:, start:end]
+                    mask_seg = mask[:, start:end]
+                    key_padding_mask = (mask_seg == 0).bool()
+
+                    if MODEL_TYPE == "lstm":
+                        leaf_pred, full_pred = model(x_seg)
+                        leaf_gt, full_gt = split_leaf_full(y_seg)
+                        leaf_loss = masked_mse(leaf_pred, leaf_gt, mask_seg)
+                        full_loss = masked_mse(full_pred, full_gt, mask_seg)
+                    elif MODEL_TYPE == "transformer":
+                        full_pred = model(x_seg, key_padding_mask=key_padding_mask)
+                        _, full_gt = split_leaf_full(y_seg)
+                        leaf_loss = torch.tensor(0.0, device=device)
+                        full_loss = masked_mse(full_pred, full_gt, mask_seg)
+                    else:
+                        leaf_pred, full_pred = model(x_seg, key_padding_mask=key_padding_mask)
+                        leaf_gt, full_gt = split_leaf_full(y_seg)
+                        leaf_loss = masked_mse(leaf_pred, leaf_gt, mask_seg)
+                        full_loss = masked_mse(full_pred, full_gt, mask_seg)
+
+                    batch_leaf += leaf_loss.item()
+                    batch_full += full_loss.item()
+
+                val_leaf_loss += batch_leaf / len(segment_indices)
+                val_full_loss += batch_full / len(segment_indices)
                 val_batches += 1
 
         val_leaf_loss /= max(1, val_batches)
         val_full_loss /= max(1, val_batches)
         val_total = val_leaf_loss + val_full_loss
 
+        epoch_time = time.perf_counter() - epoch_start
         print(
             f"Epoch [{epoch}/{epochs}] "
             f"TrainLeaf: {train_leaf_loss:.4f}  TrainFull: {train_full_loss:.4f}  TrainTotal: {train_total:.4f} | "
-            f"ValLeaf: {val_leaf_loss:.4f}  ValFull: {val_full_loss:.4f}  ValTotal: {val_total:.4f}"
+            f"ValLeaf: {val_leaf_loss:.4f}  ValFull: {val_full_loss:.4f}  ValTotal: {val_total:.4f} | "
+            f"Time: {epoch_time:.2f}s"
         )
 
-        if best_val is None or val_total < best_val:
+        if best_val is None or val_total < best_val - EARLY_STOP_MIN_DELTA:
             best_val = val_total
+            best_epoch = epoch
+            no_improve = 0
             torch.save(model.state_dict(), best_path)
+        else:
+            no_improve += 1
+            if no_improve >= EARLY_STOP_PATIENCE:
+                print(f"Early stop at epoch {epoch} (best epoch {best_epoch}).")
+                break
 
     torch.save(model.state_dict(), last_path)
+    total_time = time.perf_counter() - total_start
 
     print(f"Best model: {best_path}")
     print(f"Last model: {last_path}")
+    print(f"Total time: {total_time:.2f}s")
 
 
 if __name__ == "__main__":
