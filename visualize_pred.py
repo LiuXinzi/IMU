@@ -8,7 +8,7 @@ from matplotlib import animation
 from model_def import PoseLSTM, PoseTransformer, PoseTransformerCond
 
 # ------------------- 运行配置（直接修改下方变量） ------------------- #
-NPZ_PATH = Path("Motion/Walking/02_01_poses.npz")          # 输入轨迹 npz，包含 x 和 y
+NPZ_PATH = Path("data/05_02_poses.npz")          # 输入轨迹 npz，包含 x 和 y
 MODEL_PATH = Path("lstm/best_model.pth")
 MODEL_TYPE = "lstm"           # "lstm"、"transformer"、"transformer_cond"
 OUTPUT_PATH = Path("jump.gif")            # .gif 或 .mp4

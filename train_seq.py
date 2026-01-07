@@ -7,6 +7,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import wandb
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader, Dataset
 
@@ -14,13 +15,13 @@ from model_def import PoseLSTM, PoseTransformer, PoseTransformerCond
 
 # ------------------- 运行配置（直接修改下方变量） ------------------- #
 DATA_DIR = "data"        # 目录下所有 npz 即数据集
-OUTPUT_DIR = Path("lstm")       # 模型与归一化统计保存目录
+OUTPUT_DIR = Path("lstm1")       # 模型与归一化统计保存目录
 MODEL_TYPE = "lstm"            # 可选: "lstm"、"transformer"、"transformer_cond"
 EPOCHS = 100
-BATCH_SIZE = 50
+BATCH_SIZE = 100
 LR = 2e-4
 WEIGHT_DECAY = 1e-4
-VAL_RATIO = 0.1
+VAL_RATIO = 0.15
 SEED = 42
 # DataLoader 相关配置
 NUM_WORKERS = 0
@@ -32,12 +33,25 @@ SEGMENT_LEN = 100
 # 早停策略
 EARLY_STOP_PATIENCE = 10
 EARLY_STOP_MIN_DELTA = 0.0
+# 骨骼长度损失权重
+BONE_LOSS_WEIGHT = 1.0
+
+# SMPL 连接关系
+EDGES = [
+    (0, 1), (1, 4), (4, 7), (7, 10),
+    (0, 2), (2, 5), (5, 8), (8, 11),
+    (0, 3), (3, 6), (6, 9), (9, 12), (12, 15),
+    (9, 13), (13, 16), (16, 18), (18, 20), (20, 22),
+    (9, 14), (14, 17), (17, 19), (19, 21), (21, 23),
+]
 # Transformer 相关超参（仅在 MODEL_TYPE="transformer" 时使用）
 TF_D_MODEL = 256
 TF_NHEAD = 8
 TF_LAYERS = 4
 TF_FF = 512
 TF_DROPOUT = 0.1
+WANDB_PROJECT = "Pose_Train"
+WANDB_RUN_NAME = "train_seq"
 
 
 # ------------------- 数据集 ------------------- #
@@ -95,6 +109,32 @@ def split_leaf_full(y: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     return leaf, full
 
 
+def to_joints_tensor(y: torch.Tensor) -> torch.Tensor:
+    if y.dim() == 3 and y.shape[-1] == 72:
+        b, t, _ = y.shape
+        return y.view(b, t, 24, 3)
+    if y.dim() == 4 and y.shape[-2:] == (24, 3):
+        return y
+    raise ValueError(f"Unexpected y shape: {y.shape}")
+
+
+def bone_length_loss(
+    full_pred: torch.Tensor,
+    target_lengths: torch.Tensor,
+    mask: torch.Tensor,
+    parent_idx: torch.Tensor,
+    child_idx: torch.Tensor,
+) -> torch.Tensor:
+    joints = to_joints_tensor(full_pred)
+    diff = joints[:, :, child_idx, :] - joints[:, :, parent_idx, :]
+    lengths = torch.norm(diff, dim=-1)
+    target = target_lengths.view(1, 1, -1)
+    mask_exp = mask.unsqueeze(-1)
+    loss = ((lengths - target) ** 2) * mask_exp
+    denom = mask_exp.sum().clamp(min=1.0) * lengths.shape[-1]
+    return loss.sum() / denom
+
+
 def masked_mse(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     """
     pred/target: (B, T, D); mask: (B, T) 为1表示有效帧。
@@ -113,6 +153,31 @@ def set_seed(seed: int):
         torch.cuda.manual_seed_all(seed)
 
 
+def compute_bone_mean(paths: List[Path]) -> np.ndarray:
+    parents = np.array([p for p, _ in EDGES], dtype=np.int64)
+    children = np.array([c for _, c in EDGES], dtype=np.int64)
+    sum_lengths = np.zeros(len(EDGES), dtype=np.float64)
+    total_frames = 0
+
+    for p in paths[:100]:
+        data = np.load(p, mmap_mode="r")
+        y = data["y"]
+        if y.ndim == 2 and y.shape[1] == 72:
+            joints = y.reshape(-1, 24, 3)
+        elif y.ndim == 3 and y.shape[1:] == (24, 3):
+            joints = y
+        else:
+            raise ValueError(f"Unexpected y shape in {p}: {y.shape}")
+
+        diff = joints[:, children, :] - joints[:, parents, :]
+        lengths = np.linalg.norm(diff, axis=2)
+        sum_lengths += lengths.sum(axis=0)
+        total_frames += lengths.shape[0]
+
+    if total_frames == 0:
+        raise RuntimeError("No frames found when computing bone lengths.")
+    return (sum_lengths / total_frames).astype(np.float32)
+
 # ------------------- 训练主流程 ------------------- #
 def train(
     data_dir: Path,
@@ -126,6 +191,28 @@ def train(
 ):
     set_seed(seed)
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    wandb.init(
+        project=WANDB_PROJECT,
+        name=WANDB_RUN_NAME,
+        config={
+            "model_type": MODEL_TYPE,
+            "epochs": epochs,
+            "batch_size": batch_size,
+            "lr": lr,
+            "weight_decay": weight_decay,
+            "val_ratio": val_ratio,
+            "segment_len": SEGMENT_LEN,
+            "bone_loss_weight": BONE_LOSS_WEIGHT,
+            "tf_d_model": TF_D_MODEL,
+            "tf_nhead": TF_NHEAD,
+            "tf_layers": TF_LAYERS,
+            "tf_ff": TF_FF,
+            "tf_dropout": TF_DROPOUT,
+            "num_workers": NUM_WORKERS,
+            "pin_memory": PIN_MEMORY,
+        },
+    )
 
     all_paths = sorted(Path(data_dir).glob("*.npz"))
     if not all_paths:
@@ -141,6 +228,9 @@ def train(
 
     train_paths = [all_paths[i] for i in train_idx]
     val_paths = [all_paths[i] for i in val_idx]
+
+    print("Computing mean bone lengths...")
+    bone_mean = compute_bone_mean(train_paths)
 
     train_loader = DataLoader(
         SequenceDataset(train_paths),
@@ -164,6 +254,9 @@ def train(
     )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    bone_target = torch.from_numpy(bone_mean).to(device)
+    parent_idx = torch.tensor([p for p, _ in EDGES], device=device, dtype=torch.long)
+    child_idx = torch.tensor([c for _, c in EDGES], device=device, dtype=torch.long)
     if MODEL_TYPE == "lstm":
         model = PoseLSTM(
             input_size=72,
@@ -207,6 +300,7 @@ def train(
         model.train()
         train_leaf_loss = 0.0
         train_full_loss = 0.0
+        train_bone_loss = 0.0
         batches = 0
 
         for x_batch, y_batch, lengths in train_loader:
@@ -229,6 +323,7 @@ def train(
             optimizer.zero_grad()
             batch_leaf = 0.0
             batch_full = 0.0
+            batch_bone = 0.0
             for start, end in segment_indices:
                 x_seg = x_batch[:, start:end]
                 y_seg = y_batch[:, start:end]
@@ -239,28 +334,38 @@ def train(
                     leaf_pred, full_pred = model(x_seg)
                     leaf_gt, full_gt = split_leaf_full(y_seg)
                     leaf_loss = masked_mse(leaf_pred, leaf_gt, mask_seg)
-                    full_loss = masked_mse(full_pred, full_gt, mask_seg)
+                    full_mse = masked_mse(full_pred, full_gt, mask_seg)
                 elif MODEL_TYPE == "transformer":
                     full_pred = model(x_seg, key_padding_mask=key_padding_mask)
                     _, full_gt = split_leaf_full(y_seg)
                     leaf_loss = torch.tensor(0.0, device=device)
-                    full_loss = masked_mse(full_pred, full_gt, mask_seg)
+                    full_mse = masked_mse(full_pred, full_gt, mask_seg)
                 else:  # transformer_cond
                     leaf_pred, full_pred = model(x_seg, key_padding_mask=key_padding_mask)
                     leaf_gt, full_gt = split_leaf_full(y_seg)
                     leaf_loss = masked_mse(leaf_pred, leaf_gt, mask_seg)
-                    full_loss = masked_mse(full_pred, full_gt, mask_seg)
+                    full_mse = masked_mse(full_pred, full_gt, mask_seg)
 
+                bone_loss = bone_length_loss(
+                    full_pred,
+                    bone_target,
+                    mask_seg,
+                    parent_idx,
+                    child_idx,
+                )
+                full_loss = full_mse + BONE_LOSS_WEIGHT * bone_loss
                 loss = (leaf_loss + full_loss) / len(segment_indices)
                 loss.backward()
                 batch_leaf += leaf_loss.item()
                 batch_full += full_loss.item()
+                batch_bone += bone_loss.item()
 
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
 
             train_leaf_loss += batch_leaf / len(segment_indices)
             train_full_loss += batch_full / len(segment_indices)
+            train_bone_loss += batch_bone / len(segment_indices)
             batches += 1
 
         train_leaf_loss /= max(1, batches)
@@ -271,6 +376,7 @@ def train(
         model.eval()
         val_leaf_loss = 0.0
         val_full_loss = 0.0
+        val_bone_loss = 0.0
         val_batches = 0
         with torch.no_grad():
             for x_batch, y_batch, lengths in val_loader:
@@ -292,6 +398,7 @@ def train(
 
                 batch_leaf = 0.0
                 batch_full = 0.0
+                batch_bone = 0.0
                 for start, end in segment_indices:
                     x_seg = x_batch[:, start:end]
                     y_seg = y_batch[:, start:end]
@@ -302,23 +409,34 @@ def train(
                         leaf_pred, full_pred = model(x_seg)
                         leaf_gt, full_gt = split_leaf_full(y_seg)
                         leaf_loss = masked_mse(leaf_pred, leaf_gt, mask_seg)
-                        full_loss = masked_mse(full_pred, full_gt, mask_seg)
+                        full_mse = masked_mse(full_pred, full_gt, mask_seg)
                     elif MODEL_TYPE == "transformer":
                         full_pred = model(x_seg, key_padding_mask=key_padding_mask)
                         _, full_gt = split_leaf_full(y_seg)
                         leaf_loss = torch.tensor(0.0, device=device)
-                        full_loss = masked_mse(full_pred, full_gt, mask_seg)
+                        full_mse = masked_mse(full_pred, full_gt, mask_seg)
                     else:
                         leaf_pred, full_pred = model(x_seg, key_padding_mask=key_padding_mask)
                         leaf_gt, full_gt = split_leaf_full(y_seg)
                         leaf_loss = masked_mse(leaf_pred, leaf_gt, mask_seg)
-                        full_loss = masked_mse(full_pred, full_gt, mask_seg)
+                        full_mse = masked_mse(full_pred, full_gt, mask_seg)
+
+                    bone_loss = bone_length_loss(
+                        full_pred,
+                        bone_target,
+                        mask_seg,
+                        parent_idx,
+                        child_idx,
+                    )
+                    full_loss = full_mse + BONE_LOSS_WEIGHT * bone_loss
 
                     batch_leaf += leaf_loss.item()
                     batch_full += full_loss.item()
+                    batch_bone += bone_loss.item()
 
                 val_leaf_loss += batch_leaf / len(segment_indices)
                 val_full_loss += batch_full / len(segment_indices)
+                val_bone_loss += batch_bone / len(segment_indices)
                 val_batches += 1
 
         val_leaf_loss /= max(1, val_batches)
@@ -326,10 +444,24 @@ def train(
         val_total = val_leaf_loss + val_full_loss
 
         epoch_time = time.perf_counter() - epoch_start
+        wandb.log({
+            "epoch": epoch,
+            "train_leaf_loss": train_leaf_loss,
+            "train_full_loss": train_full_loss,
+            "train_bone_loss": train_bone_loss,
+            "train_total_loss": train_total,
+            "val_leaf_loss": val_leaf_loss,
+            "val_full_loss": val_full_loss,
+            "val_bone_loss": val_bone_loss,
+            "val_total_loss": val_total,
+            "epoch_time_s": epoch_time,
+        })
         print(
             f"Epoch [{epoch}/{epochs}] "
-            f"TrainLeaf: {train_leaf_loss:.4f}  TrainFull: {train_full_loss:.4f}  TrainTotal: {train_total:.4f} | "
-            f"ValLeaf: {val_leaf_loss:.4f}  ValFull: {val_full_loss:.4f}  ValTotal: {val_total:.4f} | "
+            f"TrainLeaf: {train_leaf_loss:.4f}  TrainFull: {train_full_loss:.4f}  "
+            f"TrainBone: {train_bone_loss:.4f}  TrainTotal: {train_total:.4f} | "
+            f"ValLeaf: {val_leaf_loss:.4f}  ValFull: {val_full_loss:.4f}  "
+            f"ValBone: {val_bone_loss:.4f}  ValTotal: {val_total:.4f} | "
             f"Time: {epoch_time:.2f}s"
         )
 
@@ -350,6 +482,7 @@ def train(
     print(f"Best model: {best_path}")
     print(f"Last model: {last_path}")
     print(f"Total time: {total_time:.2f}s")
+    wandb.finish()
 
 
 if __name__ == "__main__":
