@@ -74,60 +74,6 @@ def predict_full_seq(model: PoseLSTM, x: np.ndarray) -> np.ndarray:
 
 
 
-# def compute_metrics_over_dataset(model: PoseLSTM, npz_files: list[Path]) -> dict:
-#     """
-#     输出三个指标：
-#       - overall_mean: 全数据集、全帧、全关节平均误差 (L2)
-#       - overall_std:  全数据集、全帧、全关节误差标准差 (L2)
-#       - overall_max:  全数据集、全帧、全关节最大误差 (L2)
-#     """
-#     # Welford online stats
-#     n = 0
-#     mean = 0.0
-#     M2 = 0.0
-
-#     overall_max = 0.0
-
-#     for path in npz_files:
-#         x, y = load_npz(path)             # x:(T,72) y:(T,72) or (T,24,3)
-#         gt = to_joints(y)                 # (T,24,3)
-
-#         pred = predict_full_seq(model, x) # (T,24,3)
-
-#         T = min(pred.shape[0], gt.shape[0])
-#         pred = pred[:T]
-#         gt = gt[:T]
-
-#         err = np.linalg.norm(pred - gt, axis=2)  # (T,24)
-
-#         # update max
-#         m = float(err.max())
-#         if m > overall_max:
-#             overall_max = m
-
-#         # update mean/std with Welford
-#         flat = err.reshape(-1)
-#         for v in flat:
-#             v = float(v)
-#             n += 1
-#             delta = v - mean
-#             mean += delta / n
-#             delta2 = v - mean
-#             M2 += delta * delta2
-
-#     overall_mean = mean
-#     overall_var = (M2 / (n - 1)) if n > 1 else 0.0
-#     overall_std = float(np.sqrt(overall_var))
-
-#     return {
-#         "overall_mean": float(overall_mean),
-#         "overall_std": float(overall_std),
-#         "overall_max": float(overall_max),
-#         "num_files": len(npz_files),
-#         "num_samples": int(n),  # 全数据集误差样本数 = sum(T*24)
-#     }
-
-
 def _third_derivative_from_positions(x: np.ndarray, dt: float, n: int = 4) -> np.ndarray:
     """
     用中心差分近似三阶导（jerk）:
