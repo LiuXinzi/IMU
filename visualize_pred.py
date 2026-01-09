@@ -5,13 +5,13 @@ import torch
 import matplotlib.pyplot as plt
 from matplotlib import animation
 
-from model_def import PoseLSTM, PoseTransformer, PoseTransformerCond
+from model_def import PoseLSTM, PoseTransformer, PoseTransformerCond, PoseMLP
 
 # ------------------- 运行配置（直接修改下方变量） ------------------- #
-NPZ_PATH = Path("data/05_02_poses.npz")          # 输入轨迹 npz，包含 x 和 y
-MODEL_PATH = Path("lstm/best_model.pth")
-MODEL_TYPE = "lstm"           # "lstm"、"transformer"、"transformer_cond"
-OUTPUT_PATH = Path("jump.gif")            # .gif 或 .mp4
+NPZ_PATH = Path("Motion/Running/02_03_poses.npz")          # 输入轨迹 npz，包含 x 和 y
+MODEL_PATH = Path("mlp1/best_model.pth")
+MODEL_TYPE = "MLP"           # "lstm"、"transformer"、"transformer_cond"
+OUTPUT_PATH = Path("run_mlp.gif")            # .gif 或 .mp4
 FPS = 30
 CHUNK_LEN = 0                             # 0 表示整段推理；>0 会分段
 VIS_MODE = "compare"                         # "pred" 或 "compare"
@@ -24,6 +24,9 @@ EDGES = [
     (9, 13), (13, 16), (16, 18), (18, 20), (20, 22),
     (9, 14), (14, 17), (17, 19), (19, 21), (21, 23),
 ]
+
+LEAF_IDS = [0, 7, 8, 12, 20, 21]  # 叶节点在 24 关节索引
+
 
 
 def load_npz(path: Path):
@@ -72,6 +75,14 @@ def build_model(device: torch.device):
             leaf_output_size=18,
             full_output_size=72,
         )
+
+    elif MODEL_TYPE == "MLP":
+        model = PoseMLP(
+            input_size=72,
+            leaf_output_size=18,
+            full_output_size=24 * 3,
+        ).to(device)   
+
     else:
         raise ValueError(f"Unsupported MODEL_TYPE: {MODEL_TYPE}")
 

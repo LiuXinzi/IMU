@@ -1,0 +1,9 @@
+{
+  "data_dir": "Motion/Running",
+  "model_path": "lstm/best_model.pth",
+  "overall_mean": 0.10007242095913123,
+  "overall_std": 0.07635242145466098,
+  "overall_max": 0.6465958952903748,
+  "num_files": 21,
+  "num_samples": 75840
+}

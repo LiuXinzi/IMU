@@ -169,3 +169,45 @@ class PoseTransformerCond(nn.Module):
 
         full_pred = self.full_head(h_cond)
         return leaf_pred, full_pred
+    
+
+class MLP(nn.Module):
+    def __init__(self, n_input, n_output, n_hidden,
+                 dropout=0.2):
+        super().__init__()
+        
+        self.input_proj = nn.Linear(n_input, n_hidden)
+        self.dropout = nn.Dropout(dropout)
+        self.fc1 = nn.Linear(n_hidden, n_hidden)
+        self.fc2 = nn.Linear(n_hidden, n_hidden)
+        self.output_proj = nn.Linear(n_hidden, n_output)
+
+    def forward(self, x):
+        y = torch.relu(self.input_proj(self.dropout(x)))
+        y = torch.relu(self.fc1(y))
+        y = torch.relu(self.fc2(y))
+        output = self.output_proj(y)
+        return output
+    
+class PoseMLP(nn.Module):
+
+    def __init__(self,
+                 input_size=72,
+                 leaf_output_size=18,
+                 full_output_size=72,
+                 leaf_hidden_size=256,
+                 full_hidden_size=64):
+        super().__init__()
+        self.net1 = MLP(input_size, leaf_output_size, leaf_hidden_size)
+        self.net2 = MLP(input_size + leaf_output_size, full_output_size, full_hidden_size)
+
+    def forward(self, x):
+        leaf_seq = self.net1(x)
+        if self.training:
+            noise = torch.randn_like(leaf_seq) * 0.04
+            leaf_seq_noisy = leaf_seq + noise
+        else:
+            leaf_seq_noisy = leaf_seq
+        net2_input = torch.cat((x, leaf_seq_noisy), dim=-1)
+        full_seq = self.net2(net2_input)
+        return leaf_seq, full_seq
