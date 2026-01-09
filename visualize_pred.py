@@ -8,6 +8,9 @@ from matplotlib import animation
 from model_def import PoseLSTM, PoseTransformer, PoseTransformerCond, PoseMLP
 
 # ------------------- 运行配置（直接修改下方变量） ------------------- #
+# 日本語メモ:
+# - 推論して可視化するスクリプト。まずは NPZ_PATH / MODEL_PATH を合わせる。
+# - VIS_MODE="compare" なら予測と正解を重ねて表示。
 NPZ_PATH = Path("Motion/Running/02_03_poses.npz")          # 输入轨迹 npz，包含 x 和 y
 MODEL_PATH = Path("mlp1/best_model.pth")
 MODEL_TYPE = "MLP"           # "lstm"、"transformer"、"transformer_cond"
@@ -17,6 +20,8 @@ CHUNK_LEN = 0                             # 0 表示整段推理；>0 会分段
 VIS_MODE = "compare"                         # "pred" 或 "compare"
 
 # ------------------- SMPL edges ------------------- #
+# 日本語メモ:
+# - (parent, child) で骨格の線を描く。
 EDGES = [
     (0, 1), (1, 4), (4, 7), (7, 10),
     (0, 2), (2, 5), (5, 8), (8, 11),
@@ -30,6 +35,8 @@ LEAF_IDS = [0, 7, 8, 12, 20, 21]  # 叶节点在 24 关节索引
 
 
 def load_npz(path: Path):
+    # 日本語メモ:
+    # - npz から x/y を取り出し、float32 にそろえる。
     data = np.load(path)
     if "x" not in data or "y" not in data:
         raise KeyError("npz 必须包含 x 和 y")
@@ -45,6 +52,8 @@ def load_npz(path: Path):
 
 
 def to_joints(y: np.ndarray) -> np.ndarray:
+    # 日本語メモ:
+    # - 72次元 (24関節×3) を (24,3) に整形する。
     if y.ndim == 2 and y.shape[1] == 72:
         return y.reshape(-1, 24, 3)
     if y.ndim == 3 and y.shape[1:] == (24, 3):
@@ -53,11 +62,15 @@ def to_joints(y: np.ndarray) -> np.ndarray:
 
 
 def pelvis_center(joints: np.ndarray) -> np.ndarray:
+    # 日本語メモ:
+    # - 骨盤(0番関節)を原点にして位置をそろえる。
     pelvis = joints[:, 0:1, :]
     return joints - pelvis
 
 
 def build_model(device: torch.device):
+    # 日本語メモ:
+    # - MODEL_TYPE に応じてモデルを作って重みを読み込む。
     if MODEL_TYPE == "lstm":
         model = PoseLSTM(
             input_size=72,
@@ -94,6 +107,8 @@ def build_model(device: torch.device):
 
 
 def predict_full(model, x: np.ndarray, device: torch.device) -> np.ndarray:
+    # 日本語メモ:
+    # - 系列全体を一括で推論する。
     x_tensor = torch.from_numpy(x).unsqueeze(0).to(device)
     with torch.no_grad():
         if MODEL_TYPE == "transformer":
@@ -104,6 +119,8 @@ def predict_full(model, x: np.ndarray, device: torch.device) -> np.ndarray:
 
 
 def predict_chunked(model, x: np.ndarray, device: torch.device, chunk_len: int) -> np.ndarray:
+    # 日本語メモ:
+    # - 長い系列は分割して推論し、最後に結合する。
     preds = []
     with torch.no_grad():
         for start in range(0, x.shape[0], chunk_len):
@@ -118,6 +135,8 @@ def predict_chunked(model, x: np.ndarray, device: torch.device, chunk_len: int) 
 
 
 def set_axes_equal(ax, coords: np.ndarray):
+    # 日本語メモ:
+    # - 3軸のスケールをそろえて歪みなく表示する。
     coords = coords.reshape(-1, 3)
     mins = coords.min(axis=0)
     maxs = coords.max(axis=0)
@@ -130,6 +149,8 @@ def set_axes_equal(ax, coords: np.ndarray):
 
 
 def animate(joints_pred: np.ndarray, joints_gt: np.ndarray | None, save_path: Path, fps: int):
+    # 日本語メモ:
+    # - 3Dの関節と骨格線をアニメーションにして保存する。
     fig = plt.figure(figsize=(8, 8))
     ax = fig.add_subplot(111, projection="3d")
     ax.set_title("Pose Prediction")
@@ -153,6 +174,8 @@ def animate(joints_pred: np.ndarray, joints_gt: np.ndarray | None, save_path: Pa
     ax.legend(loc="upper right")
 
     def update(frame):
+        # 日本語メモ:
+        # - 各フレームで点と線の位置を更新。
         pred = joints_pred[frame]
         scatter_pred._offsets3d = (pred[:, 0], pred[:, 1], pred[:, 2])
         for line, (p, c) in zip(pred_lines, EDGES):
@@ -185,6 +208,8 @@ def animate(joints_pred: np.ndarray, joints_gt: np.ndarray | None, save_path: Pa
 
 
 def main():
+    # 日本語メモ:
+    # - 入力/モデルを読み込み → 推論 → 表示/保存。
     if not NPZ_PATH.exists():
         raise FileNotFoundError(f"npz not found: {NPZ_PATH}")
     if not MODEL_PATH.exists():
